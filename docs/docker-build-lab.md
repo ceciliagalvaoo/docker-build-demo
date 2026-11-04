@@ -762,7 +762,291 @@ Notes on the rows:
 
 ## Task 5 – Multi-stage builds
 
-_Pending._
+Environment: Docker Engine 28.5.1 / BuildKit v0.25.1 on WSL2, branch `task-5-multistage`. Both Dockerfiles are exactly the ones from the lab: [`dotnet-app/Dockerfile`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/dotnet-app/Dockerfile) and [`java-app/Dockerfile`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/java-app/Dockerfile). The earlier variants (`Dockerfile.naive`, `Dockerfile.cache`) are kept unchanged.
+
+### 5.1 .NET
+
+```text
+$ cd dotnet-app && docker build --progress=plain -t demo-dotnet:multistage .
+#3 docker-image://docker.io/docker/dockerfile:1@sha256:4edf897a3ffa...       ← the "# syntax=" line loads the Dockerfile frontend
+#7 [build 1/7] FROM mcr.microsoft.com/dotnet/sdk:10.0@sha256:de4fe90a9884...
+#8 [final 1/3] FROM mcr.microsoft.com/dotnet/aspnet:10.0@sha256:de0ee358cdd6...
+#11 [build 2/7] WORKDIR /src                                  CACHED
+#12 [build 3/7] COPY Directory.Build.props ./                 CACHED
+#13 [build 4/7] COPY src/DemoApi/DemoApi.csproj src/DemoApi/  CACHED
+#14 [build 5/7] RUN dotnet restore src/DemoApi/DemoApi.csproj CACHED
+#15 [build 6/7] COPY src/DemoApi/ src/DemoApi/                CACHED
+#16 [build 7/7] RUN dotnet publish ... -o /app/publish --no-restore
+#16 6.243   DemoApi -> /app/publish/
+#17 [final 3/3] COPY --from=build /app/publish .
+exit=0, wall 11.60 s
+```
+
+Steps 2–6 of the `build` stage were already `CACHED` on the very first build, because they are **identical** to the steps of `Dockerfile.cache` (same base image digest, same instructions, same files). The BuildKit cache is shared between Dockerfiles; only `publish` (a different `-o` path) had to run.
+
+```text
+$ docker run --rm -p 8080:8080 demo-dotnet:multistage
+      Now listening on: http://[::]:8080
+$ curl http://localhost:8080/weatherforecast
+[{"date":"2026-11-05","temperatureC":43,"summary":"Scorching","temperatureF":109}, ...]
+HTTP 200
+
+$ docker exec <container> sh -c 'id; grep Uid /proc/1/status; cat /proc/1/cmdline; dotnet --list-sdks; dotnet --list-runtimes; ls /app'
+id: uid=1654(app) gid=1654(app) groups=1654(app)
+Uid:    1654    1654    1654    1654
+PID1: dotnet DemoApi.dll
+dotnet --list-sdks:        (empty: no SDK in the image)
+Microsoft.AspNetCore.App 10.0.14 [/usr/share/dotnet/shared/Microsoft.AspNetCore.App]
+Microsoft.NETCore.App 10.0.14 [/usr/share/dotnet/shared/Microsoft.NETCore.App]
+/app: DemoApi DemoApi.deps.json DemoApi.dll DemoApi.pdb DemoApi.runtimeconfig.json
+      DemoApi.staticwebassets.endpoints.json Microsoft.AspNetCore.OpenApi.dll Microsoft.OpenApi.dll
+      appsettings.Development.json appsettings.json web.config            (940 KB)
+/root/.nuget, /src: No such file or directory
+```
+
+The final image contains only the ASP.NET Core **runtime** and the published files. There is no SDK, no source, no `obj/` and no NuGet cache. The process runs as `app` (uid 1654): `USER $APP_UID` was resolved at build time and is stored as `USER 1654` (see `docker history` below). The image still contains a shell and `apt-get` (Debian-based runtime image); the chiseled variant (optional, below) removes those.
+
+### 5.2 Java
+
+```text
+$ cd java-app && docker build --progress=plain -t demo-java:multistage .
+#7 [build 1/6] FROM docker.io/library/maven:3-eclipse-temurin-21@sha256:9673eef9ed50...   CACHED
+#8 [final 1/4] FROM docker.io/library/eclipse-temurin:21-jre@sha256:0b99b3376fbb...
+#9 [build 2/6] WORKDIR /build
+#11 [build 3/6] COPY pom.xml .
+#12 [build 4/6] RUN mvn -B -ntp dependency:go-offline
+#13 [final 2/4] WORKDIR /app                                  ← final stage runs in parallel with the build stage
+#14 [final 3/4] RUN groupadd --system app && useradd --system --gid app --no-create-home app
+#12 22.01 [INFO] BUILD SUCCESS
+#12 DONE 22.1s
+#15 [build 5/6] COPY src ./src
+#16 [build 6/6] RUN mvn -B -ntp package -DskipTests
+#16 5.293 [INFO] Building jar: /build/target/demo-0.0.1-SNAPSHOT.jar
+#17 [final 4/4] COPY --from=build /build/target/*.jar app.jar
+exit=0, wall 33.54 s
+```
+
+The interleaved `[build …]` and `[final …]` lines show step 6 of the build breakdown (Task 2): the two stages are independent until `COPY --from=build`, so BuildKit pulled the JRE image and created the user **while** Maven was downloading the dependencies.
+
+```text
+$ docker run --rm -p 8080:8080 demo-java:multistage
+... Tomcat started on port 8080 (http) with context path '/'
+... Started DemoApplication in 2.31 seconds (process running for 2.949)
+$ curl http://localhost:8080/
+{"timestamp":"2026-11-04T16:20:52.176Z","status":404,"error":"Not Found","path":"/"}
+HTTP 404          ← Spring's error handler answers: the app is up (template has no controller)
+
+$ docker exec <container> sh -c 'id; grep Uid /proc/1/status; cat /proc/1/cmdline; java -version; ls $JAVA_HOME/bin; which javac mvn; ls -l /app'
+id: uid=999(app) gid=999(app) groups=999(app)
+Uid:    999     999     999     999
+PID1: java -jar app.jar
+openjdk version "21.0.13" 2026-10-20 LTS  (Temurin-21.0.13+9)
+$JAVA_HOME/bin: java jfr jrunscript jwebserver keytool rmiregistry       ← a JRE: no javac, no jar, no jshell
+which javac mvn: (not found)
+/app: -rw-r--r-- 1 root root 19963214 Feb  1  1980 app.jar
+$ docker run --rm --user 0 --entrypoint sh demo-java:multistage -c 'ls /root/.m2'
+ls: cannot access '/root/.m2': No such file or directory              ← no Maven repository in the image
+```
+
+The JAR is owned by root and is only readable (`-rw-r--r--`) by the `app` user. That is enough to run it, and the application cannot modify its own code.
+
+### `docker history` of the final images
+
+```text
+$ docker history demo-dotnet:multistage
+IMAGE          CREATED              CREATED BY                                      SIZE      COMMENT
+51c7ca30643b   About a minute ago   ENTRYPOINT ["dotnet" "DemoApi.dll"]             0B        buildkit.dockerfile.v0
+<missing>      About a minute ago   USER 1654                                       0B        buildkit.dockerfile.v0
+<missing>      About a minute ago   EXPOSE [8080/tcp]                               0B        buildkit.dockerfile.v0
+<missing>      About a minute ago   COPY /app/publish . # buildkit                  926kB     buildkit.dockerfile.v0
+<missing>      About a minute ago   WORKDIR /app                                    0B        buildkit.dockerfile.v0
+<missing>      9 days ago           COPY /dotnet /usr/share/dotnet # buildkit       27.1MB    buildkit.dockerfile.v0
+<missing>      9 days ago           ENV ASPNET_VERSION=10.0.14                      0B        buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c ln -s /usr/share/dotnet/dotne…   24B       buildkit.dockerfile.v0
+<missing>      9 days ago           COPY /dotnet /usr/share/dotnet # buildkit       82.8MB    buildkit.dockerfile.v0
+<missing>      9 days ago           ENV DOTNET_VERSION=10.0.14                      0B        buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c groupadd         --gid=$APP_U…   9.64kB    buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c apt-get update     && apt-get…   42MB      buildkit.dockerfile.v0
+<missing>      9 days ago           ENV APP_UID=1654 ASPNETCORE_HTTP_PORTS=8080 …   0B        buildkit.dockerfile.v0
+<missing>      10 days ago          /bin/sh -c #(nop)  CMD ["/bin/bash"]            0B
+<missing>      10 days ago          /bin/sh -c #(nop) ADD file:eed88e94d6aa7c9da…   78.2MB
+...
+Layers=8  Size=230,984,930 B  User="1654"  Entrypoint=["dotnet","DemoApi.dll"]
+
+$ docker history demo-java:multistage
+IMAGE          CREATED          CREATED BY                                      SIZE      COMMENT
+81ab25fc1a5c   30 seconds ago   ENTRYPOINT ["java" "-jar" "app.jar"]            0B        buildkit.dockerfile.v0
+<missing>      30 seconds ago   EXPOSE [8080/tcp]                               0B        buildkit.dockerfile.v0
+<missing>      30 seconds ago   USER app                                        0B        buildkit.dockerfile.v0
+<missing>      30 seconds ago   COPY /build/target/*.jar app.jar # buildkit     20MB      buildkit.dockerfile.v0
+<missing>      52 seconds ago   RUN /bin/sh -c groupadd --system app && user…   4.71kB    buildkit.dockerfile.v0
+<missing>      52 seconds ago   WORKDIR /app                                    0B        buildkit.dockerfile.v0
+<missing>      5 days ago       ENTRYPOINT ["/__cacert_entrypoint.sh"]          0B        buildkit.dockerfile.v0
+<missing>      5 days ago       COPY --chmod=755 entrypoint.sh /__cacert_ent…   5.98kB    buildkit.dockerfile.v0
+<missing>      5 days ago       RUN /bin/sh -c set -eux;     ARCH="$(dpkg --…   166MB     buildkit.dockerfile.v0
+<missing>      5 days ago       ENV JAVA_VERSION=jdk-21.0.13+9                  0B        buildkit.dockerfile.v0
+<missing>      5 days ago       RUN /bin/sh -c set -eux;     apt-get update;…   52.6MB    buildkit.dockerfile.v0
+<missing>      10 days ago      umoci raw add-layer --image /home/buildd/roc…   102MB
+...  (0 B metadata rows of the base image omitted)
+Layers=9  Size=339,759,374 B  User="app"  Entrypoint=["java","-jar","app.jar"]
+```
+
+None of the build-stage instructions (`COPY pom.xml`, `dependency:go-offline`, `dotnet restore`, `dotnet publish`, …) appear in these histories. The only trace of the `build` stage is the result of `COPY --from=build`: 926 kB (.NET) and 20 MB (Java).
+
+### 5.3 Comparison table
+
+**How it was measured.**
+
+- **Size:** `docker images` (exact bytes from `docker image inspect --format '{{.Size}}'`).
+- **Tools:** checked with `docker exec`/`docker run --entrypoint`: `dotnet --list-sdks`, `dotnet --list-runtimes`, `ls $JAVA_HOME/bin`, `which javac mvn`.
+- **User:** `.Config.User` plus `id` inside a running container.
+- **Rebuild time:** wall time of `docker build --progress=plain -f <file> -t <tag> .` measured with `/usr/bin/time`. Conditions:
+  - all on WSL2, with the Task 4 `.dockerignore` files in place;
+  - base images already present and the cache **warm** (one untimed build of each variant right before);
+  - before each timed build, a new comment line was appended to `src/DemoApi/Program.cs` (.NET) or `src/main/java/hr/demo/demo/DemoApplication.java` (Java);
+  - **3 runs per variant**, median reported;
+  - the source files were restored afterwards (`sha256sum -c` OK).
+
+  The build context lives on the Windows filesystem (`/mnt/c/...`). In these runs the context transfer itself took 0.2–0.4 s; the rest of the wall time beyond the build steps is BuildKit overhead (resolving metadata, exporting the image). The absolute numbers are only comparable within this table.
+
+| Image | Size | Contains SDK/JDK/Maven? | Runs as root? | Rebuild time after editing a source file (median; 3 runs) |
+|-------|------|--------------------------|---------------|------------------------------------------------------------|
+| `demo-dotnet:naive` | **925 MB** | Yes: .NET SDK 10.0.403 (+ PowerShell) | **Yes** (uid 0, `User=""`) | **12.27 s** (10.71 / 12.27 / 12.29): `COPY . .` + `RUN dotnet publish` incl. restore (`Restored ... in 2.1 sec`, step 9.7 s) |
+| `demo-dotnet:cache` | **925 MB** | Yes: .NET SDK 10.0.403 | **Yes** (uid 0, `User=""`) | **8.47 s** (8.71 / 8.47 / 8.14): restore `CACHED`, only `COPY src` + `publish` (6.4 s) |
+| `demo-dotnet:multistage` | **231 MB** | No: ASP.NET Core runtime 10.0.14 only | No: `app` (uid 1654) | **7.81 s** (8.99 / 7.81 / 7.52): restore `CACHED`, `publish` (4.7 s) + `COPY --from` |
+| `demo-java:naive` | **649 MB** | Yes: JDK 21.0.13 + Maven 3.10.0 | **Yes** (uid 0, `User=""`) | **22.72 s** (22.72 / 22.80 / 19.50): `RUN mvn package` downloads all dependencies again (19.3 s) |
+| `demo-java:multistage` | **340 MB** | No: JRE 21.0.13 only (no `javac`, no `mvn`) | No: `app` (uid 999) | **9.48 s** (9.48 / 9.37 / 9.73): `dependency:go-offline` `CACHED`, only `COPY src` + `mvn package` (5.7 s) |
+
+The naive sizes are the values after Task 4 (with `.dockerignore`). The Task 3 values, without it, were 940 MB and 669 MB.
+
+Observations:
+
+- **Size:** multi-stage shrinks the .NET image by 75 % (925 → 231 MB) and the Java image by 48 % (649 → 340 MB). Of the 231 MB, only 926 kB is our application; the rest is the runtime base image.
+- **Rebuild time:** the big win is the dependency layer. For Java, the median drops from 22.7 s to 9.5 s, because the naive build downloads all Maven dependencies on every code edit. For .NET, the gain is smaller (12.3 → 8.5 → 7.8 s), because this app has only one NuGet package.
+- **The multi-stage build can even skip the final `COPY`.** In `demo-java:multistage`, `COPY --from=build ... app.jar` was **`CACHED`** after a comment edit. The comment does not change the bytecode, and `spring-boot:repackage` produces a reproducible JAR (fixed timestamps, `Feb 1 1980`), so the copied file had the same checksum and the final layers were reused.
+
+### Answers
+
+**1. Why is the JDK needed in the build stage, but a JRE is enough in the final stage?**
+
+Building means compiling `.java` sources to bytecode with `javac`, and packaging with `jar` / the Spring Boot plugin. These tools are part of the JDK (Java Development Kit), and Maven itself needs a JDK. Running the application only needs the JVM and the class library, which is the JRE (Java Runtime Environment). The final image's `$JAVA_HOME/bin` indeed contains only `java`, `jfr`, `jrunscript`, `jwebserver`, `keytool` and `rmiregistry`, and no `javac`. The JRE layer is 166 MB against 308 MB for the JDK in the Maven image, and the compiler is no longer available to an attacker.
+
+**2. Why are tests skipped inside the image build (`-DskipTests`)?**
+
+- **Speed and the cache:** tests run on every rebuild of the `package` layer, and the Spring `contextLoads` test starts a whole application context (14.5 s natively in Task 1).
+- **Reports are lost:** test reports written inside a build layer are not easily accessible.
+- **Responsibility:** the image build should produce the artifact. In this Dockerfile the tests would run in the build stage, whose content is thrown away anyway.
+- **Test dependencies:** tests often need things that are not available during `docker build`, such as databases or network.
+
+Skipping them here is a trade-off, not a recommendation. Task 6 adds a **separate `test` stage**, so that tests run only when they are explicitly targeted.
+
+**3. Why is `COPY pom.xml .` followed by `dependency:go-offline` before `COPY src ./src`?**
+
+It applies Rules 1 and 2. `pom.xml` (the dependency definition) changes rarely, and the source changes often. Copying only `pom.xml` and running `dependency:go-offline` downloads all dependencies and plugins into `/root/.m2` in a layer whose cache key depends **only on `pom.xml`**. A code change then invalidates only `COPY src` and `mvn package`, while the download stays `CACHED`. Measured above: 9.5 s instead of 22.7 s per rebuild.
+
+**4. Which instructions of the final stage only change the metadata, and which add files?**
+
+- **.NET:** `FROM ...aspnet:10.0` adds the runtime base layers. `WORKDIR /app` creates the directory (an almost empty layer, 0 B in history). `COPY --from=build /app/publish .` adds the files (926 kB). `EXPOSE 8080`, `USER $APP_UID` and `ENTRYPOINT [...]` are metadata only (0 B).
+- **Java:** `FROM eclipse-temurin:21-jre` adds the base layers. `WORKDIR /app` creates the directory. `RUN groupadd ... && useradd ...` adds files (4.71 kB: the changes to `/etc/passwd`, `/etc/group`, `/etc/shadow`). `COPY --from=build ... app.jar` adds 20 MB. `USER app`, `EXPOSE 8080` and `ENTRYPOINT [...]` are metadata only.
+
+**5. What happens to the `build` stage when the build finishes? Is it in the final image?**
+
+No. The `build` stage only exists as **build cache** in BuildKit, which is why the next build can reuse its layers (`CACHED`). It is not part of the final image's layer list: the `docker history` above contains no SDK/Maven instruction and no source code, and the sizes (231 MB / 340 MB) are those of the runtime base plus our artifact. It has no tag either, so it never appears in `docker images`. The final image only contains the files that `COPY --from=build` explicitly took from it. The stage can be built on its own for debugging with `docker build --target build -t demo-dotnet:build .`.
+
+### Annotated multi-stage Dockerfile (`dotnet-app/Dockerfile`)
+
+Legend:
+
+- **[files]**: creates a filesystem layer. **[meta]**: only changes the image config / build state.
+- **[cached]** / **[rebuilt]**: what happens when only the source code (`src/DemoApi/*.cs`) changes. Verified in the rebuild measurement above.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+#   ↑ Parser directive (not an instruction): use the latest stable Dockerfile frontend v1. [meta: no layer] [cached]
+
+############ Stage 1: build ############
+#   ↑ Comment, ignored by the builder.
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+#   ↑ Start stage "build" from the .NET SDK image (resolved to a digest); "AS build" names it for COPY --from.
+#     [files: the SDK base layers] [cached: same digest]
+
+WORKDIR /src
+#   ↑ Set (and create) /src as the working directory of the following instructions.
+#     [files: empty directory; otherwise meta] [cached]
+
+COPY Directory.Build.props ./
+#   ↑ Copy the shared MSBuild settings (Version, TreatWarningsAsErrors), needed for restore and build.
+#     [files] [cached: the file did not change]
+
+COPY src/DemoApi/DemoApi.csproj src/DemoApi/
+#   ↑ Copy ONLY the project file = the dependency definition (PackageReference list).
+#     [files] [cached: the .csproj did not change]
+
+RUN dotnet restore src/DemoApi/DemoApi.csproj
+#   ↑ Download the NuGet packages into /root/.nuget/packages and write obj/project.assets.json.
+#     [files] [cached: parent layers unchanged; this is the point of the ordering]
+
+COPY src/DemoApi/ src/DemoApi/
+#   ↑ Copy the source code (Program.cs, appsettings*.json, ...); bin/ and obj/ are excluded by .dockerignore.
+#     [files] [rebuilt: the checksum of the copied files changed]
+
+RUN dotnet publish src/DemoApi/DemoApi.csproj \
+        -c Release -o /app/publish --no-restore
+#   ↑ Compile in Release and write the deployable output to /app/publish, reusing the restore above.
+#     [files] [rebuilt: its parent layer (the COPY above) is new, Rule 1]
+
+############ Stage 2: runtime ############
+#   ↑ Comment.
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
+#   ↑ Start a NEW stage from the runtime-only ASP.NET image; nothing of "build" is carried over implicitly.
+#     [files: runtime base layers] [cached]
+
+WORKDIR /app
+#   ↑ Create /app and make it the working directory (also the directory the app starts in).
+#     [files: empty directory; otherwise meta] [cached]
+
+COPY --from=build /app/publish .
+#   ↑ Copy ONLY the published files from the build stage (not from the build context) into /app.
+#     [files: ~926 kB] [rebuilt: the published DLL/PDB changed]
+
+EXPOSE 8080
+#   ↑ Document that the app listens on 8080 (the ASP.NET image sets ASPNETCORE_HTTP_PORTS=8080); does not publish it.
+#     [meta] [re-applied to the config; no layer to rebuild]
+
+USER $APP_UID
+#   ↑ Run as the non-root user "app" (APP_UID=1654 is set by the base image); stored as "USER 1654".
+#     [meta] [no layer]
+
+ENTRYPOINT ["dotnet", "DemoApi.dll"]
+#   ↑ Exec form: the container runs "dotnet DemoApi.dll" as PID 1, so it receives SIGTERM directly.
+#     [meta] [no layer]
+```
+
+### Optional: chiseled runtime image
+
+A temporary copy of `dotnet-app/Dockerfile` with only the final `FROM` changed to `mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled` was built (not committed; the image was deleted afterwards):
+
+```text
+demo-dotnet:chiseled-exp   125MB          (vs 231 MB for aspnet:10.0)
+User="1654"                               (USER $APP_UID still works; chiseled images also define APP_UID)
+curl /weatherforecast → HTTP 200
+
+$ docker exec -it <container> sh
+OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH: unknown
+exit=127
+$ docker exec <container> /bin/bash
+... exec: "/bin/bash": stat /bin/bash: no such file or directory: unknown
+```
+
+`docker exec ... sh` fails because a chiseled image contains **no shell** (and no package manager): only the runtime, the minimal libraries and the app. That is mainly a **feature**:
+
+- An attacker who gets code execution in the app cannot open a shell, install tools with `apt` or run shell scripts.
+- There are far fewer packages with CVEs.
+- The image is 46 % smaller.
+
+The downside is **debugging**: an operator cannot look around inside the container. Debugging has to happen through logs, metrics or an ephemeral debug container that shares the process namespace (for example, `docker run --pid=container:<id>` with a tool image, or `kubectl debug`).
 
 ## Task 6 – ARG, LABEL, test stage and BuildKit features
 
@@ -784,8 +1068,10 @@ _Pending._
 | 3 | Naive Dockerfiles built and analyzed with `docker history` | ✅ Done |
 | 4 | Cache behavior observed and the table filled in | ✅ Done (tag `10.0.0` does not exist; documented, tested with `10.0.403` and `10.0.100` instead) |
 | 4 | `.dockerignore` files created | ✅ Done (context 15.99 MB → 4.55 kB and 20.02 MB → 23.48 kB) |
-| 5 | Multi-stage Dockerfiles for .NET and Java, running as non-root | ⏳ Pending |
-| 5 | Image comparison table filled in with own measurements | ⏳ Pending |
+| 5 | Multi-stage Dockerfiles for .NET and Java, running as non-root | ✅ Done (uid 1654 / uid 999) |
+| 5 | Image comparison table filled in with own measurements | ✅ Done (WSL2, warm cache, median of 3) |
+| 5 | Annotated multi-stage Dockerfile | ✅ Done |
+| 5 | Chiseled runtime image | ✅ Optional, done (125 MB, no shell) |
 | 6 | `ARG`, `LABEL`, a `test` stage and a cache mount used | ⏳ Pending |
 | 6 | Secret leak demonstrated, and a secret mount used | ⏳ Pending |
 | 6 | Multi-platform build | ⏳ Optional |
