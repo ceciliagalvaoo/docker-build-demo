@@ -955,6 +955,8 @@ No. The `build` stage only exists as **build cache** in BuildKit, which is why t
 
 ### Annotated multi-stage Dockerfile (`dotnet-app/Dockerfile`)
 
+This is the file as it was at the end of Task 5. Task 6 later extends it with `ARG`, `LABEL`, a `test` stage and cache mounts, and the current version is listed in the Task 6 section.
+
 Legend:
 
 - **[files]**: creates a filesystem layer. **[meta]**: only changes the image config / build state.
@@ -1050,7 +1052,308 @@ The downside is **debugging**: an operator cannot look around inside the contain
 
 ## Task 6 – ARG, LABEL, test stage and BuildKit features
 
-_Pending._
+Environment: Docker Engine 28.5.1 / BuildKit v0.25.1 on WSL2, branch `task-6-buildkit-features`. Both multi-stage Dockerfiles were extended. The naive and cache variants are unchanged. Temporary edits (a failing assertion, extra Maven dependencies) were reverted from byte-exact backups (`sha256sum -c` OK). The secret experiments ran in an isolated scratch directory **outside the repository** with the fake value `demo-secret-not-real`.
+
+### Final Dockerfiles
+
+[`dotnet-app/Dockerfile`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/dotnet-app/Dockerfile):
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# Global ARG: declared before the first FROM, so it can only be used in FROM lines.
+ARG DOTNET_VERSION=10.0
+
+############ Stage 1: build ############
+FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION} AS build
+WORKDIR /src
+
+COPY Directory.Build.props ./
+COPY src/DemoApi/DemoApi.csproj src/DemoApi/
+# Cache mount: the NuGet download cache lives outside the image layers.
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet restore src/DemoApi/DemoApi.csproj
+
+COPY src/DemoApi/ src/DemoApi/
+# Declared here (not right after FROM) so that a new version does not invalidate the restore above.
+ARG APP_VERSION=0.0.0
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet publish src/DemoApi/DemoApi.csproj \
+        -c Release -o /app/publish --no-restore -p:Version=${APP_VERSION}
+
+############ Test stage (only runs with --target test) ############
+FROM build AS test
+COPY tests/DemoApi.Tests/ tests/DemoApi.Tests/
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet test tests/DemoApi.Tests/DemoApi.Tests.csproj -c Release
+
+############ Stage 2: runtime ############
+FROM mcr.microsoft.com/dotnet/aspnet:${DOTNET_VERSION} AS final
+# ARGs are scoped to a stage: APP_VERSION must be declared again to be used here.
+ARG APP_VERSION=0.0.0
+LABEL org.opencontainers.image.version=${APP_VERSION} \
+      org.opencontainers.image.source="https://github.com/ceciliagalvaoo/docker-build-demo" \
+      org.opencontainers.image.description="Demo API" \
+      org.opencontainers.image.licenses="MIT"
+WORKDIR /app
+
+COPY --from=build /app/publish .
+
+EXPOSE 8080
+USER $APP_UID
+ENTRYPOINT ["dotnet", "DemoApi.dll"]
+```
+
+[`java-app/Dockerfile`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/java-app/Dockerfile) received the same features:
+
+- `ARG JAVA_VERSION=21` used in both `FROM` lines;
+- a cache mount on `/root/.m2` for every `mvn` call;
+- a `test` stage `FROM build AS test` + `RUN mvn -B -ntp test`;
+- `ARG APP_VERSION` + the OCI labels in the final stage.
+
+The `ARG`/`LABEL` block was placed **after** `RUN groupadd ...` for the same cache reason as in the .NET file.
+
+**Deviation from the lab snippet (placement of `ARG APP_VERSION` in the build stage).** The lab declares `ARG APP_VERSION` right after `FROM ... AS build`. With BuildKit, every `RUN` after an `ARG` declaration receives the value as an environment variable, so a new version would also invalidate `dotnet restore`. Declaring it just before `dotnet publish` keeps the restore cached. This was verified (see 6.1). The behavior is otherwise identical.
+
+### 6.1 Build arguments
+
+```text
+$ docker build --progress=plain --build-arg APP_VERSION=0.1.0 -t demo-dotnet:0.1.0 .
+#13 [build 5/7] RUN --mount=type=cache,target=/root/.nuget/packages     dotnet restore ...   DONE 5.2s
+#15 [build 7/7] RUN --mount=type=cache,... dotnet publish ... --no-restore -p:Version=0.1.0     DONE 6.9s
+#17 [final 3/3] COPY --from=build /app/publish .                                              CACHED
+exit=0
+
+$ docker image inspect demo-dotnet:0.1.0 --format '{{json .Config.Labels}}'
+{
+    "org.opencontainers.image.description": "Demo API",
+    "org.opencontainers.image.licenses": "MIT",
+    "org.opencontainers.image.source": "https://github.com/ceciliagalvaoo/docker-build-demo",
+    "org.opencontainers.image.version": "0.1.0"
+}
+
+$ docker run --rm --entrypoint sh demo-dotnet:0.1.0 -c 'grep -o "\"DemoApi/[^\"]*\"" DemoApi.deps.json'
+"DemoApi/0.1.0"                     ← the build argument reached MSBuild (-p:Version) as well
+```
+
+The restore ran again here because it is the first build with a cache mount (a new instruction text, so a new cache key). `COPY --from` was `CACHED` because `Directory.Build.props` already sets `Version=0.1.0`, so the published files were byte-identical to the Task 5 build.
+
+Only the version changed (`--build-arg APP_VERSION=0.2.0`, experiment image deleted afterwards):
+
+```text
+#13 [build 5/7] RUN ... dotnet restore src/DemoApi/DemoApi.csproj          CACHED     ← ARG declared after it
+#14 [build 6/7] COPY src/DemoApi/ src/DemoApi/                             CACHED
+#15 [build 7/7] RUN ... dotnet publish ... -p:Version=0.2.0                DONE 5.5s  ← uses the new value
+#17 [final 3/3] COPY --from=build /app/publish .                           DONE 0.1s
+version label: 0.2.0
+```
+
+Without `--build-arg`, the default applies: `version label: 0.0.0`.
+
+**Why must `APP_VERSION` be declared in both stages? What happens if you forget it in `final`?**
+
+An `ARG` is scoped to the stage in which it is declared, from the declaration to the end of that stage. A new `FROM` starts a new scope, and a global `ARG` (before the first `FROM`) is visible only in `FROM` lines. The `build` stage needs it for `-p:Version`, and the `final` stage needs it for the `LABEL`, so each stage declares it. A temporary copy without `ARG APP_VERSION` in `final` was built with `--build-arg APP_VERSION=0.1.0`:
+
+```text
+1 warning found (use docker --debug to expand):
+ - UndefinedVar: Usage of undefined variable '$APP_VERSION' (line 32)
+version label: ""
+```
+
+The build does **not** fail: it only warns. The variable expands to an empty string, so the image silently gets an empty `org.opencontainers.image.version` label. This is easy to miss, which is why it is worth checking the labels with `docker image inspect` (or `docker build --check`, which reports the same `UndefinedVar` warning).
+
+### 6.2 Labels
+
+The labels shown above come from the `final` stage. The Java image has the same set (`description: "Demo Spring Boot app"`). It also still carries labels **inherited from its base image**, for example `org.opencontainers.image.title: "ubuntu"` and `org.opencontainers.image.created` from the Temurin base, because labels are inherited unless they are overwritten:
+
+```text
+$ docker image inspect demo-java:multistage --format '{{json .Config.Labels}}'
+{"org.opencontainers.image.created":"2026-10-25T10:26:07.538865+00:00","org.opencontainers.image.description":"Demo Spring Boot app",
+ "org.opencontainers.image.licenses":"MIT","org.opencontainers.image.source":"https://github.com/ceciliagalvaoo/docker-build-demo",
+ "org.opencontainers.image.title":"ubuntu","org.opencontainers.image.version":"0.1.0"}
+```
+
+`org.opencontainers.image.source` points to this repository, which is what links the GHCR package to the repository in Task 7.
+
+### 6.3 Test stage
+
+**Running the test stage explicitly:**
+
+```text
+$ cd dotnet-app && docker build --progress=plain --target test -t demo-dotnet:test .
+#10 [build 5/7] RUN ... dotnet restore ...                       CACHED
+#13 [build 7/7] RUN ... dotnet publish ...                       CACHED
+#14 [test 1/2] COPY tests/DemoApi.Tests/ tests/DemoApi.Tests/    DONE 0.1s
+#15 [test 2/2] RUN ... dotnet test tests/DemoApi.Tests/DemoApi.Tests.csproj -c Release
+#15 10.80 Test run for /src/tests/DemoApi.Tests/bin/Release/net10.0/DemoApi.Tests.dll (.NETCoreApp,Version=v10.0)
+#15 13.49 Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: 23 ms - DemoApi.Tests.dll (net10.0)
+#15 DONE 13.6s
+exit=0
+
+$ cd java-app && docker build --progress=plain --target test -t demo-java:test .
+#13 [test 1/1] RUN --mount=type=cache,target=/root/.m2     mvn -B -ntp test
+#13 9.533 [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.424 s -- in hr.demo.demo.DemoApplicationTests
+#13 9.570 [INFO] BUILD SUCCESS
+#13 DONE 9.6s
+exit=0
+```
+
+**Building the final image skips the test stage:**
+
+```text
+$ docker build --progress=plain --build-arg APP_VERSION=0.1.0 -t demo-dotnet:multistage .     → exit=0
+$ docker build --progress=plain --build-arg APP_VERSION=0.1.0 -t demo-java:multistage .       → exit=0
+test-stage lines in log ([test ...]): 0 and 0
+```
+
+The logs contain only `[build …]` and `[final …]` steps. BuildKit builds the dependency graph from the target backwards, and `final` depends only on `build` (through `COPY --from=build`), never on `test`. `demo-dotnet:multistage` and `demo-dotnet:0.1.0` are the same image (ID `112fb9bf0f34`).
+
+**A failing test makes `--target test` fail.** `Assert.True(false);` was added temporarily to `UnitTest1.Test1`:
+
+```text
+$ docker build --progress=plain --target test -t demo-dotnet:test .; echo $?
+#15 [test 2/2] RUN --mount=type=cache,target=/root/.nuget/packages     dotnet test tests/DemoApi.Tests/DemoApi.Tests.csproj -c Release
+#15 10.35   Failed DemoApi.Tests.UnitTest1.Test1 [13 ms]
+#15 10.35    Assert.True() Failure
+#15 10.35 Expected: True
+#15 10.35 Actual:   False
+#15 10.36 Failed!  - Failed:     1, Passed:     0, Skipped:     0, Total:     1, Duration: 142 ms - DemoApi.Tests.dll (net10.0)
+#15 ERROR: process "/bin/sh -c dotnet test tests/DemoApi.Tests/DemoApi.Tests.csproj -c Release" did not complete successfully: exit code: 1
+ERROR: failed to build: failed to solve: process "/bin/sh -c dotnet test ..." did not complete successfully: exit code: 1
+1                                     ← echo $? (non-zero)
+```
+
+With the same failing test, `docker build -t demo-dotnet:multistage .` (no `--target`) still **succeeded** (exit 0). A pipeline therefore has to run `--target test` explicitly, or make the final stage depend on the test stage. Afterwards the test file was restored (`sha256sum -c` OK) and `--target test` passed again (exit 0). This was run in bash on WSL2, so the exit code was read with `echo $?`; from PowerShell the same check would be `wsl docker build ... ; $LASTEXITCODE`.
+
+**Advantage and downside of running the tests inside the Docker build.**
+
+- **Advantage:** the tests run in exactly the same pinned, reproducible environment as the build (the same SDK image, the same restored packages, Linux), on any machine and in CI, without a locally installed SDK. "Works on my machine" differences disappear, and the exit code can directly gate the pipeline.
+- **Downsides:**
+  - Test reports (`TestResults/*.trx`, `surefire-reports`, coverage) stay inside a build layer and need extra steps to get out, for example a separate export stage with `--output`.
+  - The output appears only as build log lines.
+  - The run is **slower**: the test stage has to build the test project in the container (13.6 s for one trivial .NET test, 9.6 s for Java, where the Spring test starts a whole application context).
+  - Tests that need external services (databases, network) are hard to run during `docker build`.
+  - When the cache is hit, the tests are **not re-run**. That is correct for identical input, but surprising.
+
+### 6.4 BuildKit cache mounts
+
+Both multi-stage Dockerfiles now use cache mounts (`/root/.nuget/packages` for .NET, `/root/.m2` for Java) on every step that restores, builds or tests.
+
+**Experiment (Java).** Two variants were compared on the same context:
+
+- **A:** the Task 5 `Dockerfile`, *without* a cache mount (a copy kept outside the repository);
+- **B:** the new `Dockerfile`, *with* the cache mount.
+
+Both were first built with the original `pom.xml` (all steps `CACHED`). Then one dependency was added to `pom.xml` and both variants were rebuilt, timed with `/usr/bin/time`. Then a second dependency was added and the measurement repeated. `pom.xml` was restored afterwards (`sha256sum -c` OK).
+
+| Change to `pom.xml` | Variant | Wall time | `dependency:go-offline` step | `package` step |
+|---------------------|---------|-----------|------------------------------|----------------|
+| none (warm-up) | A, no cache mount | 3.93 s | CACHED | CACHED |
+| none (warm-up) | B, cache mount | 4.28 s | CACHED | CACHED |
+| + `commons-lang3` | A, no cache mount | **30.69 s** | 22.0 s | 5.2 s |
+| + `commons-lang3` | B, cache mount | **19.92 s** | **5.1 s** | 10.7 s |
+| + `spring-boot-starter-actuator` | A, no cache mount | **38.99 s** | 23.8 s | 11.0 s |
+| + `spring-boot-starter-actuator` | B, cache mount | **24.54 s** | **11.9 s** | 7.1 s |
+
+The `pom.xml` change is a cache miss in **both** variants: `COPY pom.xml` changes, so `dependency:go-offline` is executed again. The difference is what the step finds:
+
+- **Without a cache mount**, the previous downloads lived in the old (now invalid) layer, so Maven starts from an empty `/root/.m2` and downloads **everything** again (22–24 s).
+- **With a cache mount**, `/root/.m2` still contains everything downloaded before, so only the new artifacts are fetched (5.1 s / 11.9 s; actuator brings in more transitive dependencies such as Micrometer).
+
+Overall, the rebuild after a dependency change was 35–37 % faster. The `package` step varied between runs in both variants (5.2–11.0 s) and does not show a consistent difference; the gain is in the dependency step.
+
+**The cache is not part of the image.** The `build` stage of both variants (`--target build`, experiment images deleted afterwards):
+
+```text
+== variant A (no cache mount)   size=672MB
+$ du -sh /root/.m2  →  96M   /root/.m2
+$ docker history ... | grep mvn
+20MB      RUN /bin/sh -c mvn -B -ntp package -DskipTes…
+87.4MB    RUN /bin/sh -c mvn -B -ntp dependency:go-off…
+
+== variant B (cache mount)      size=585MB
+$ du -sh /root/.m2  →  /root/.m2: absent
+$ docker history ... | grep mvn
+20MB      RUN /bin/sh -c mvn -B -ntp package -DskipTes…
+0B        RUN /bin/sh -c mvn -B -ntp dependency:go-off…     ← the download is NOT in a layer
+```
+
+BuildKit keeps the mounted directories as separate cache records (`docker system df -v` lists them as `exec.cachemount`: 18.3 MB, 77.5 MB and 88.3 MB here). They are mounted only while a `RUN` executes and never become part of any image. That is why the cache is allowed to survive a cache miss: it cannot change the image content, only how fast it is produced. If the cache is pruned, the build still works, just slower. With cache mounts, the `build` stage also got 87 MB smaller.
+
+### 6.5 BuildKit secrets
+
+**The leak.** A throwaway Dockerfile, built in a scratch directory outside the repository, with a fake value. The image was never pushed and was deleted afterwards:
+
+```dockerfile
+FROM alpine:3.20
+ARG TOKEN=my-secret-value
+RUN echo "using token" > /dev/null
+```
+
+```text
+$ docker build -t leak-demo --build-arg TOKEN=demo-secret-not-real .
+1 warning found (use docker --debug to expand):
+ - SecretsUsedInArgOrEnv: Do not use ARG or ENV instructions for sensitive data (ARG "TOKEN") (line 2)
+
+$ docker history --no-trunc leak-demo
+CREATED BY                                                                               SIZE
+RUN |1 TOKEN=demo-secret-not-real /bin/sh -c echo "using token" > /dev/null # buildkit   0B
+ARG TOKEN=demo-secret-not-real                                                           0B
+CMD ["/bin/sh"]                                                                          0B
+
+$ docker save leak-demo | tar -xO | grep -a -o "TOKEN=demo-secret-not-real" | sort | uniq -c
+      2 TOKEN=demo-secret-not-real
+```
+
+The value is found **twice in the image metadata**: in the `ARG` history entry and in the `RUN` entry, where BuildKit records the build arguments that were in scope (`|1 TOKEN=...`). This happens even though the `RUN` never uses the variable. Anyone who can pull the image can read it with `docker history`. BuildKit itself warns (`SecretsUsedInArgOrEnv`), but the build succeeds.
+
+**The secret mount.**
+
+```dockerfile
+FROM alpine:3.20
+RUN --mount=type=secret,id=demo_token \
+    echo "token length: $(wc -c < /run/secrets/demo_token)"
+```
+
+```text
+$ echo -n "demo-secret-not-real" > token.txt
+$ docker build --secret id=demo_token,src=token.txt --progress=plain -t secret-demo .
+#5 [stage-0 2/2] RUN --mount=type=secret,id=demo_token     echo "token length: $(wc -c < /run/secrets/demo_token)"
+#5 0.390 token length: 20                      ← the secret was available to this RUN (20 characters)
+
+$ docker history --no-trunc secret-demo
+CREATED BY                                                                          SIZE
+RUN /bin/sh -c echo "token length: $(wc -c < /run/secrets/demo_token)" # buildkit   0B
+CMD ["/bin/sh"]                                                                     0B
+
+$ docker save secret-demo | tar -xO | grep -a -c 'demo-secret-not-real'
+0
+
+$ docker run --rm secret-demo sh -c 'ls -la /run/secrets; cat /run/secrets/demo_token'
+ls: /run/secrets: No such file or directory
+cat: can't open '/run/secrets/demo_token': No such file or directory
+
+$ rm token.txt
+```
+
+The secret is mounted as a file (`/run/secrets/demo_token`, in memory) **only during that one `RUN`**. It is not written to any layer, it is not in the history, it is not in the image config (0 matches in the whole `docker save` archive), it does not exist in a container, and it is not part of the cache key. `token.txt` was created only in the scratch directory, deleted right after the build, and never existed in the repository (`find ... -name token.txt` → 0). Both `leak-demo` and `secret-demo` were deleted and never pushed.
+
+### 6.6 Optional: multi-platform builds (not executed)
+
+```text
+$ docker buildx ls
+NAME/NODE       DRIVER/ENDPOINT   STATUS    BUILDKIT   PLATFORMS
+default*        docker
+ \_ default      \_ default       running   v0.25.1    linux/amd64 (+3), linux/386
+
+$ docker buildx build --platform linux/amd64,linux/arm64 -t demo-dotnet:multi .
+ERROR: failed to build: Multi-platform build is not supported for the docker driver.
+Switch to a different driver, or turn on the containerd image store, and try again.
+```
+
+The only builder uses the `docker` driver with the classic image store (`overlay2`), and no QEMU `binfmt` handler for arm64 is registered on this WSL2 host. Making it work would require creating a `docker-container` builder (`docker buildx create --use`) plus emulation, or enabling the containerd image store, which means changing the local Docker setup. Since the item is optional, it was **not executed**.
+
+**Why the .NET and Java images are portable across architectures.** Both apps compile to **platform-independent intermediate code**: .NET IL in `DemoApi.dll`, Java bytecode in `app.jar`. A runtime (the .NET CLR, the JVM) JIT-compiles it to machine code for the CPU it runs on. The same `publish/` folder or JAR runs on amd64 and arm64; only the runtime underneath must match the CPU. The official base images (`aspnet:10.0`, `eclipse-temurin:21-jre`) are multi-arch manifests that provide such a runtime for each architecture, and a multi-platform build would just copy the same app files onto each variant. A **native compiled binary** (C/C++, Go, Rust, .NET Native AOT) contains machine instructions for one instruction set (x86-64 *or* ARM64), so it must be compiled once per target architecture.
 
 ## Task 7 – Tagging, publishing and running the image
 
@@ -1072,8 +1375,8 @@ _Pending._
 | 5 | Image comparison table filled in with own measurements | ✅ Done (WSL2, warm cache, median of 3) |
 | 5 | Annotated multi-stage Dockerfile | ✅ Done |
 | 5 | Chiseled runtime image | ✅ Optional, done (125 MB, no shell) |
-| 6 | `ARG`, `LABEL`, a `test` stage and a cache mount used | ⏳ Pending |
-| 6 | Secret leak demonstrated, and a secret mount used | ⏳ Pending |
-| 6 | Multi-platform build | ⏳ Optional |
+| 6 | `ARG`, `LABEL`, a `test` stage and a cache mount used | ✅ Done (`--target test` passes; fails with exit code 1 on a failing test) |
+| 6 | Secret leak demonstrated, and a secret mount used | ✅ Done (fake value only; images never pushed, deleted) |
+| 6 | Multi-platform build | ➖ Optional, not executed (docker driver does not support it; explained) |
 | 7 | Image tagged, pushed to `ghcr.io`, pulled and run, also by digest | ⏳ Pending |
 | 8 | Project containerized and documented | ➖ Out of scope for this report (separate deliverable in the project repository) |
