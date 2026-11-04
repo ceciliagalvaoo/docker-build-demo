@@ -1173,7 +1173,7 @@ $ docker image inspect demo-java:multistage --format '{{json .Config.Labels}}'
  "org.opencontainers.image.title":"ubuntu","org.opencontainers.image.version":"0.1.0"}
 ```
 
-`org.opencontainers.image.source` points to this repository, which is what links the GHCR package to the repository in Task 7.
+`org.opencontainers.image.source` points to the [`ceciliagalvaoo/docker-build-demo`](https://github.com/ceciliagalvaoo/docker-build-demo) repository, which is what links the GHCR package to that repository in Task 7.
 
 ### 6.3 Test stage
 
