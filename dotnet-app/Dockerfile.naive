@@ -1,0 +1,6 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0
+WORKDIR /app
+COPY . .
+RUN dotnet publish src/DemoApi/DemoApi.csproj -c Release -o out
+ENV ASPNETCORE_HTTP_PORTS=8080
+ENTRYPOINT ["dotnet", "out/DemoApi.dll"]

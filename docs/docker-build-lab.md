@@ -408,7 +408,220 @@ The experiment images (`anatomy-demo:*`) were deleted after the observations.
 
 ## Task 3 – Naive Dockerfiles
 
-_Pending._
+Both Dockerfiles are exactly the ones from the lab and are kept unchanged as the baseline: [`dotnet-app/Dockerfile.naive`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/dotnet-app/Dockerfile.naive) and [`java-app/Dockerfile.naive`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/java-app/Dockerfile.naive).
+
+```dockerfile
+# dotnet-app/Dockerfile.naive
+FROM mcr.microsoft.com/dotnet/sdk:10.0
+WORKDIR /app
+COPY . .
+RUN dotnet publish src/DemoApi/DemoApi.csproj -c Release -o out
+ENV ASPNETCORE_HTTP_PORTS=8080
+ENTRYPOINT ["dotnet", "out/DemoApi.dll"]
+```
+
+```dockerfile
+# java-app/Dockerfile.naive
+FROM maven:3-eclipse-temurin-21
+WORKDIR /app
+COPY . .
+RUN mvn -B -ntp package -DskipTests
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "target/demo-0.0.1-SNAPSHOT.jar"]
+```
+
+Conditions: Docker Engine 28.5.1 / BuildKit v0.25.1 on WSL2. Both base images were pulled during these builds, so this is a cold build. There is no `.dockerignore` yet, and the working folders still contain the outputs of the Task 1 native builds (`dotnet-app`: `bin/` + `obj/` + `publish/` ≈ 16 MB; `java-app/target/` = 20 MB). That is the realistic situation of a developer machine.
+
+### 3.1 .NET – build and run
+
+```text
+$ cd dotnet-app
+$ docker build --progress=plain -f Dockerfile.naive -t demo-dotnet:naive .
+#2 [internal] load metadata for mcr.microsoft.com/dotnet/sdk:10.0
+#4 [1/4] FROM mcr.microsoft.com/dotnet/sdk:10.0@sha256:de4fe90a98845d75910b9769662465c84de1a934665c431279d1382b2bddc02b
+#5 [internal] load build context
+#5 transferring context: 15.99MB 4.1s done
+#4 DONE 24.1s                                          ← SDK image download + extract
+#6 [2/4] WORKDIR /app
+#7 [3/4] COPY . .
+#8 [4/4] RUN dotnet publish src/DemoApi/DemoApi.csproj -c Release -o out
+#8 3.266   Restored /app/src/DemoApi/DemoApi.csproj (in 1.57 sec).
+#8 7.130   DemoApi -> /app/src/DemoApi/bin/Release/net10.0/DemoApi.dll
+#8 7.194   DemoApi -> /app/out/
+#8 DONE 7.3s
+#9 naming to docker.io/library/demo-dotnet:naive done
+exit=0, wall time 33.9 s
+
+$ docker run --rm -p 8080:8080 demo-dotnet:naive
+info: Microsoft.Hosting.Lifetime[14]
+      Now listening on: http://[::]:8080
+      Hosting environment: Production
+      Content root path: /app
+
+$ curl http://localhost:8080/weatherforecast
+[{"date":"2026-11-05","temperatureC":-19,"summary":"Scorching","temperatureF":-2},{"date":"2026-11-06","temperatureC":22,"summary":"Bracing","temperatureF":71}, ...]
+HTTP 200
+```
+
+The SDK inside the image is 10.0.403 (`docker exec ... dotnet --list-sdks`), so the `global.json` from Task 1 (10.0.100, `latestFeature`) is satisfied.
+
+### 3.2 Java – build and run
+
+```text
+$ cd java-app
+$ docker build --progress=plain -f Dockerfile.naive -t demo-java:naive .
+#4 [1/4] FROM docker.io/library/maven:3-eclipse-temurin-21@sha256:9673eef9ed503146591667ffb92eaaa22f1b8899ed60d9df0df4da3f3a1214a6
+#5 transferring context: 20.02MB 1.3s done
+#4 DONE 14.5s
+#7 [3/4] COPY . .
+#8 [4/4] RUN mvn -B -ntp package -DskipTests
+#8 15.98 [INFO] Building jar: /app/target/demo-0.0.1-SNAPSHOT.jar
+#8 17.52 [INFO] BUILD SUCCESS
+#8 17.52 [INFO] Total time:  15.790 s
+#8 DONE 17.7s
+#9 naming to docker.io/library/demo-java:naive done
+exit=0, wall time 37.7 s
+
+$ docker run --rm -p 8080:8080 demo-java:naive
+ :: Spring Boot ::                (v4.1.2)
+... Tomcat started on port 8080 (http) with context path '/'
+... Started DemoApplication in 2.177 seconds (process running for 2.776)
+
+$ curl http://localhost:8080/
+{"timestamp":"2026-11-04T16:08:13.776Z","status":404,"error":"Not Found","path":"/"}
+HTTP 404        ← Spring Boot's error handler answers: the app is up (the template has no controller, see Task 1)
+```
+
+The image runs Maven 3.10.0 and `javac 21.0.13` (Temurin JDK 21).
+
+### 3.3 Inspection
+
+```text
+$ docker images
+REPOSITORY    TAG     IMAGE ID       SIZE
+demo-java     naive   cb7a5fc968f4   669MB
+demo-dotnet   naive   362d3c9b23b1   940MB
+```
+
+| Image | Size (`docker images`) | Exact size (`.Size`) | Filesystem layers (`RootFS.Layers`) | Our own layers |
+|-------|------------------------|----------------------|-------------------------------------|----------------|
+| `demo-dotnet:naive` | **940 MB** | 939,873,285 B | 14 | `COPY . .` 15.9 MB + `RUN dotnet publish` 6.2 MB |
+| `demo-java:naive` | **669 MB** | 668,596,654 B | 13 | `COPY . .` 20 MB + `RUN mvn package` 83.8 MB |
+
+For comparison: the deployable output itself is the 916 KB `publish/` folder and the 20 MB JAR (Task 1).
+
+#### `docker history demo-dotnet:naive`
+
+```text
+IMAGE          CREATED              CREATED BY                                      SIZE      COMMENT
+362d3c9b23b1   About a minute ago   ENTRYPOINT ["dotnet" "out/DemoApi.dll"]         0B        buildkit.dockerfile.v0
+<missing>      About a minute ago   ENV ASPNETCORE_HTTP_PORTS=8080                  0B        buildkit.dockerfile.v0
+<missing>      About a minute ago   RUN /bin/sh -c dotnet publish src/DemoApi/De…   6.2MB     buildkit.dockerfile.v0
+<missing>      About a minute ago   COPY . . # buildkit                             15.9MB    buildkit.dockerfile.v0
+<missing>      About a minute ago   WORKDIR /app                                    0B        buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c powershell_version=7.6.8     …   60.9MB    buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c ln -s /usr/share/dotnet/dnx /…   21B       buildkit.dockerfile.v0
+<missing>      9 days ago           COPY /PowerShell.Linux.x64.7.6.8.nupkg / # b…   21.1MB    buildkit.dockerfile.v0
+<missing>      9 days ago           COPY /dotnet /usr/share/dotnet # buildkit       531MB     buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c apt-get update     && apt-get…   74.9MB    buildkit.dockerfile.v0
+<missing>      9 days ago           ENV DOTNET_GENERATE_ASPNET_CERTIFICATE=false…   0B        buildkit.dockerfile.v0
+<missing>      9 days ago           COPY /dotnet /usr/share/dotnet # buildkit       27.1MB    buildkit.dockerfile.v0
+<missing>      9 days ago           ENV ASPNET_VERSION=10.0.14                      0B        buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c ln -s /usr/share/dotnet/dotne…   24B       buildkit.dockerfile.v0
+<missing>      9 days ago           COPY /dotnet /usr/share/dotnet # buildkit       82.8MB    buildkit.dockerfile.v0
+<missing>      9 days ago           ENV DOTNET_VERSION=10.0.14                      0B        buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c groupadd         --gid=$APP_U…   9.64kB    buildkit.dockerfile.v0
+<missing>      9 days ago           RUN /bin/sh -c apt-get update     && apt-get…   42MB      buildkit.dockerfile.v0
+<missing>      9 days ago           ENV APP_UID=1654 ASPNETCORE_HTTP_PORTS=8080 …   0B        buildkit.dockerfile.v0
+<missing>      10 days ago          /bin/sh -c #(nop)  CMD ["/bin/bash"]            0B
+<missing>      10 days ago          /bin/sh -c #(nop) ADD file:eed88e94d6aa7c9da…   78.2MB
+<missing>      10 days ago          /bin/sh -c #(nop)  LABEL org.opencontainers.…   0B
+<missing>      10 days ago          /bin/sh -c #(nop)  ARG RELEASE                  0B
+...
+```
+
+#### `docker history demo-java:naive`
+
+```text
+IMAGE          CREATED          CREATED BY                                      SIZE      COMMENT
+cb7a5fc968f4   19 seconds ago   ENTRYPOINT ["java" "-jar" "target/demo-0.0.1…   0B        buildkit.dockerfile.v0
+<missing>      19 seconds ago   EXPOSE [8080/tcp]                               0B        buildkit.dockerfile.v0
+<missing>      19 seconds ago   RUN /bin/sh -c mvn -B -ntp package -DskipTes…   83.8MB    buildkit.dockerfile.v0
+<missing>      37 seconds ago   COPY . . # buildkit                             20MB      buildkit.dockerfile.v0
+<missing>      37 seconds ago   WORKDIR /app                                    0B        buildkit.dockerfile.v0
+<missing>      17 hours ago     CMD ["mvn"]                                     0B        buildkit.dockerfile.v0
+<missing>      17 hours ago     ENTRYPOINT ["/usr/local/bin/mvn-entrypoint.s…   0B        buildkit.dockerfile.v0
+<missing>      17 hours ago     ENV MAVEN_CONFIG=/root/.m2                      0B        buildkit.dockerfile.v0
+<missing>      17 hours ago     COPY /usr/share/maven /usr/share/maven # bui…   11.8MB    buildkit.dockerfile.v0
+<missing>      17 hours ago     RUN /bin/sh -c apt-get update   && apt-get i…   76.3MB    buildkit.dockerfile.v0
+<missing>      5 days ago       COPY --chmod=755 entrypoint.sh /__cacert_ent…   5.98kB    buildkit.dockerfile.v0
+<missing>      5 days ago       RUN /bin/sh -c set -eux;     ARCH="$(dpkg --…   308MB     buildkit.dockerfile.v0
+<missing>      5 days ago       ENV JAVA_VERSION=jdk-21.0.13+9                  0B        buildkit.dockerfile.v0
+<missing>      5 days ago       RUN /bin/sh -c set -eux;     apt-get update;…   67MB      buildkit.dockerfile.v0
+<missing>      10 days ago      umoci raw add-layer --image /home/buildd/roc…   102MB
+...  (metadata-only rows of the base image omitted: LABEL/ENV/umoci config, all 0B)
+```
+
+#### Layers, entrypoint and user
+
+```text
+$ docker image inspect demo-dotnet:naive --format '{{json .RootFS.Layers}}'
+["sha256:bec87777bc2f...","sha256:fa09e76fa81b...","sha256:7be251a39e9c...","sha256:2c16277b36ff...",
+ "sha256:361fe91f35cc...","sha256:eaa51743b39d...","sha256:d81312fed0de...","sha256:b6fd3ac23e41...",
+ "sha256:af2d9ffb5214...","sha256:a4bb267a5014...","sha256:e8cce59db267...","sha256:f01b1409e595...",
+ "sha256:aa7f149967f7...","sha256:5301209a9dac..."]                       # 14 layers
+
+$ docker image inspect demo-dotnet:naive --format '{{json .Config.Entrypoint}} {{json .Config.User}}'
+["dotnet","out/DemoApi.dll"] ""
+
+$ docker image inspect demo-java:naive --format '{{json .Config.Entrypoint}} {{json .Config.User}}'
+["java","-jar","target/demo-0.0.1-SNAPSHOT.jar"] ""
+```
+
+Inside the running containers (`docker exec`):
+
+```text
+demo-dotnet:naive                                demo-java:naive
+uid=0(root) gid=0(root) groups=0(root)           uid=0(root) gid=0(root) groups=0(root)
+USER   PID COMMAND                               USER   PID COMMAND
+root     1 dotnet out/DemoApi.dll                root     1 java -jar target/demo-0.0.1-SNAPSHOT.jar
+
+/app (18 MB): DemoApp.slnx Directory.Build.props  /app (20 MB): .gitattributes .gitignore .mvn
+  Dockerfile.naive global.json out publish src      Dockerfile.naive HELP.md mvnw mvnw.cmd pom.xml
+  tests                                             src target
+/root/.nuget: 3.0 MB                              /root/.m2: 69 MB
+dotnet --list-sdks → 10.0.403                     mvn -v → Apache Maven 3.10.0; javac 21.0.13
+```
+
+### Answers
+
+**Which layer is the largest? Why does a runtime image contain the whole SDK, the source code and the `obj/` folders?**
+
+The largest layers belong to the **base image**, not to our application:
+
+- **.NET:** `COPY /dotnet /usr/share/dotnet` (**531 MB**, the .NET SDK), followed by the Ubuntu base (78.2 MB), the apt packages (74.9 MB + 42 MB) and PowerShell (60.9 MB + 21.1 MB). Our own two layers add only 22 MB to 940 MB.
+- **Java:** the JDK layer `RUN ... ARCH="$(dpkg ...` (**308 MB**), followed by the Ubuntu base (102 MB) and the apt packages (76.3 MB + 67 MB). Among our own layers, `RUN mvn package` (83.8 MB) is the largest: it contains the whole Maven local repository `/root/.m2` (69 MB of downloaded plugins and dependencies) plus the rebuilt `target/`.
+
+The runtime image contains all of this because a single-stage Dockerfile **has only one image**: the one used to build is the one that is shipped. Everything that `FROM` brought in for building (SDK/JDK, Maven, compilers, PowerShell) and everything that `COPY . .` and `RUN` put on disk stays in the layers:
+
+- `COPY . .` copied the whole build context: the source code, `tests/`, `Dockerfile.naive`, and also the local `bin/`, `obj/` and `publish/` folders from Task 1 (15.9 MB), because there is no `.dockerignore`.
+- `dotnet publish` then created a new `obj/` and `bin/` inside the image and filled the NuGet cache.
+
+Nothing is ever removed, and even a `rm` in a later step would not shrink the earlier layers.
+
+**Which user does the application run as?**
+
+`root` (uid 0) in both images. `.Config.User` is empty (`""`), which means root, and `docker exec ... id` / `ps` confirm that PID 1 (`dotnet` / `java`) runs as `root`. The SDK image even defines a non-root user `app` (`APP_UID=1654`, visible in `docker history`), but the naive Dockerfile never switches to it.
+
+**At least three problems with these images:**
+
+1. **Size:** 940 MB and 669 MB to ship a 916 KB folder and a 20 MB JAR. Every pull, push and deploy moves hundreds of MB, and the registry and nodes store them.
+2. **Attack surface:** the images ship a full SDK/JDK, a compiler, Maven, PowerShell, `apt`, a shell and many OS packages. An attacker who gets into the container has a complete toolchain, and every one of these packages adds CVEs to scan and patch.
+3. **Runs as root:** a vulnerability in the app gives root inside the container, which makes a container escape or tampering with the filesystem much easier.
+4. **Source code and build leftovers in the image:** the source, tests, `Dockerfile.naive`, `obj/` and `bin/` from the developer's machine (even `HELP.md` and `.gitignore`), plus `/root/.nuget` and `/root/.m2`. Any local file, for example a `.env` with secrets, would be copied the same way.
+5. **Slow rebuilds:** `COPY . .` comes before the restore/package step. Any change to any file, even a comment or a README, invalidates the `COPY` layer, and by Rule 1 the dependency download (NuGet restore, the 69 MB Maven repository) runs again. A large context (16–20 MB without `.dockerignore`) is also sent on every build. Task 4 measures this.
+6. **Not reproducible:** the result depends on what is lying in the local folder. The Java build runs `mvn package` without `clean` on top of the copied local `target/`. The base images are referenced by moving tags (`sdk:10.0`, `maven:3-eclipse-temurin-21`).
+7. **No tests:** `-DskipTests` skips the tests, and the .NET Dockerfile never runs `dotnet test` (addressed in Task 6).
 
 ## Task 4 – Layer cache and `.dockerignore`
 
@@ -435,7 +648,7 @@ _Pending._
 | 0 | Public `docker-build-demo` repository created and cloned; tools checked | ✅ Done |
 | 1 | .NET and Java apps built with their native tools; build steps listed | ✅ Done (native, WSL2) |
 | 2 | Task 2 questions answered (with real build observations) | ✅ Done |
-| 3 | Naive Dockerfiles built and analyzed with `docker history` | ⏳ Pending |
+| 3 | Naive Dockerfiles built and analyzed with `docker history` | ✅ Done |
 | 4 | Cache behavior observed and the table filled in | ⏳ Pending |
 | 4 | `.dockerignore` files created | ⏳ Pending |
 | 5 | Multi-stage Dockerfiles for .NET and Java, running as non-root | ⏳ Pending |
