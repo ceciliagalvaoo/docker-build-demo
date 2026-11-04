@@ -480,3 +480,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Lab 6: keep the cache-ordered Dockerfile (matched by *.[Cc]ache above)
+!Dockerfile.cache

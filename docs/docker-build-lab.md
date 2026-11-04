@@ -625,7 +625,140 @@ Nothing is ever removed, and even a `rm` in a later step would not shrink the ea
 
 ## Task 4 – Layer cache and `.dockerignore`
 
-_Pending._
+Environment: Docker Engine 28.5.1 / BuildKit v0.25.1 on WSL2, branch `task-4-cache-dockerignore`. All temporary edits below (one character in `Program.cs`, an extra NuGet package in `DemoApi.csproj`, other base image tags) were made only for measuring. Afterwards they were reverted from a byte-exact backup, verified with `sha256sum -c`. The base-image experiments used temporary copies of `Dockerfile.cache` outside the repository, so the committed files contain none of these changes.
+
+### 4.1 Observing (and breaking) the cache with the naive Dockerfile
+
+**Rebuild without editing anything.** The first rebuild in this task was, surprisingly, **not** fully cached:
+
+```text
+$ docker build --progress=plain -f Dockerfile.naive -t demo-dotnet:naive .
+#5 transferring context: 35.14kB 4.8s done
+#6 [2/4] WORKDIR /app
+#6 CACHED
+#7 [3/4] COPY . .                                             ← executed, not CACHED
+#8 [4/4] RUN dotnet publish src/DemoApi/DemoApi.csproj ...    ← executed, not CACHED
+[wall 12.95s]
+```
+
+Investigation: `file Dockerfile.naive` reported `CRLF line terminators`, with a modification time of 17:11:19, which is exactly when `git switch main && git pull` ran with Windows Git (`core.autocrlf=true`). The checkout had rewritten `Dockerfile.naive` (committed in Task 3 with LF) with CRLF endings. Without a `.dockerignore`, `Dockerfile.naive` is part of the context and is copied by `COPY . .`, so its new checksum invalidated the `COPY` layer and, by Rule 1, the `RUN` after it. This is a real example of a file that has **nothing to do with the application** breaking the cache, which the `Dockerfile*` line of `.dockerignore` (4.2) prevents.
+
+Running the same command again, now without any change:
+
+```text
+#6 [2/4] WORKDIR /app
+#6 CACHED
+#7 [3/4] COPY . .
+#7 CACHED
+#8 [4/4] RUN dotnet publish src/DemoApi/DemoApi.csproj -c Release -o out
+#8 CACHED
+```
+
+**Edit one character in `src/DemoApi/Program.cs`** (`// Add services to the container.` → `...container!`, a comment):
+
+```text
+$ docker build --progress=plain -f Dockerfile.naive -t demo-dotnet:naive .
+#6 [2/4] WORKDIR /app
+#6 CACHED
+#7 [3/4] COPY . .
+#7 DONE 0.1s                                                   ← rebuilt
+#8 [4/4] RUN dotnet publish src/DemoApi/DemoApi.csproj -c Release -o out
+#8 3.075   Restored /app/src/DemoApi/DemoApi.csproj (in 1.59 sec).   ← NuGet restore repeated
+#8 6.284   DemoApi -> /app/src/DemoApi/bin/Release/net10.0/DemoApi.dll
+#8 6.356   DemoApi -> /app/out/
+#8 DONE 6.5s                                                   ← rebuilt
+[wall 12.97s]
+```
+
+**Which steps were rebuilt?** `COPY . .` and `RUN dotnet publish`. Only `FROM` and `WORKDIR` were reused.
+
+**Was the NuGet restore repeated? Why?** Yes (`Restored ... (in 1.59 sec)`). `dotnet publish` restores implicitly, and the restore happens in the same `RUN` layer as the compilation. That layer comes after `COPY . .`, whose cache key contains the checksum of **every** file in the context. A comment in `Program.cs` changes that checksum, so the `COPY` layer misses the cache, and by Rule 1 so does the `RUN`, including the dependency download that has not changed at all. With only one small package, the restore costs about 1.6 s here. In a real project with many packages, every code edit would pay for the complete download again.
+
+### 4.2 `.dockerignore`
+
+Both files were created exactly as in the lab: [`dotnet-app/.dockerignore`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/dotnet-app/.dockerignore) and [`java-app/.dockerignore`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/java-app/.dockerignore).
+
+**How it was measured.** BuildKit transfers the context *incrementally*: on a repeated build it only sends what changed (see the 35 kB above). To compare full context sizes, the context-transfer cache of the builder was cleared before each measurement with `docker builder prune -f --filter type=source.local` (this does not remove any layer cache). Then the naive build was run and its `transferring context` line recorded. In addition, the content that actually arrives in the builder was counted with a throwaway Dockerfile (`FROM alpine:3.20` / `COPY . /ctx` / `RUN find /ctx -type f | wc -l; du -sh /ctx`, built with `--no-cache`).
+
+| Context | `transferring context` (full) | Files | Size in builder | Largest parts |
+|---------|-------------------------------|-------|-----------------|---------------|
+| `dotnet-app/` **without** `.dockerignore` | **15.99 MB** | 334 | 16.4 MB | `tests/` 12.9 MB (test `bin/`), `src/` 2.5 MB (`bin/`, `obj/`), `publish/` 940 KB, `Dockerfile.naive`, `.gitignore` |
+| `dotnet-app/` **with** `.dockerignore` | **4.55 kB** | 11 | 68 KB | `src/` 36 KB, `tests/` 16 KB, `DemoApp.slnx`, `Directory.Build.props`, `global.json` |
+| `java-app/` **without** `.dockerignore` | **20.02 MB** | 23 | 19.3 MB | `target/` 19.2 MB (fat JAR, classes), `src/` 68 KB, `mvnw*`, `.mvn/` |
+| `java-app/` **with** `.dockerignore` | **23.48 kB** | 8 | 116 KB | `src/` 68 KB, `mvnw`, `mvnw.cmd`, `.mvn/`, `pom.xml`, `.gitattributes` |
+
+The context shrank by about **3,500×** for .NET (15.99 MB → 4.55 kB, 334 → 11 files) and about **850×** for Java (20.02 MB → 23.48 kB, 23 → 8 files). What is left is only the source and the build definitions.
+
+Side effects observed:
+
+- The naive images got smaller, because `COPY . .` no longer copies the local build output: `demo-dotnet:naive` **940 MB → 925 MB**, `demo-java:naive` **669 MB → 649 MB**.
+- The images are now reproducible from the sources. The local `bin/`, `obj/` and `target/` of the developer's machine can no longer leak into the image, and a local `.env` would be excluded.
+- Files that are irrelevant for the build (`Dockerfile*`, `*.md`, `.gitignore`) can no longer invalidate the cache, which is exactly what happened in 4.1 with the CRLF rewrite of `Dockerfile.naive`.
+
+### 4.3 Ordering the instructions for the cache
+
+[`dotnet-app/Dockerfile.cache`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/dotnet-app/Dockerfile.cache), exactly as in the lab:
+
+```dockerfile
+FROM mcr.microsoft.com/dotnet/sdk:10.0
+WORKDIR /src
+
+# 1. dependency definition only → this layer changes rarely
+COPY Directory.Build.props ./
+COPY src/DemoApi/DemoApi.csproj src/DemoApi/
+RUN dotnet restore src/DemoApi/DemoApi.csproj
+
+# 2. source code → this layer changes often
+COPY src/DemoApi/ src/DemoApi/
+RUN dotnet publish src/DemoApi/DemoApi.csproj -c Release -o /app --no-restore
+
+ENV ASPNETCORE_HTTP_PORTS=8080
+WORKDIR /app
+ENTRYPOINT ["dotnet", "DemoApi.dll"]
+```
+
+**Naive vs cache-friendly order.** The naive file copies *everything* and then runs one command that restores and compiles. The cache-friendly file copies only the files that define dependencies (`Directory.Build.props`, `DemoApi.csproj`), restores, and only then copies the source and compiles with `--no-restore`. The expensive restore layer now depends only on the dependency definition, not on the code.
+
+Git note: the `.gitignore` generated by `dotnet new gitignore` contains the Visual Studio rule `*.[Cc]ache` (line 236), which matched `Dockerfile.cache`, so the file would silently never have been committed (`git check-ignore -v dotnet-app/Dockerfile.cache` → `dotnet-app/.gitignore:236:*.[Cc]ache`). An exception `!Dockerfile.cache` was added at the end of `dotnet-app/.gitignore`.
+
+Initial build (`docker build -f Dockerfile.cache -t demo-dotnet:cache .`): all 8 steps executed, `Restored ... (in 1.5 sec)`, wall time 9.56 s. `docker run -p 8080:8080 demo-dotnet:cache` + `curl /weatherforecast` → **HTTP 200**. Size **925 MB** (still the full SDK; Task 5 fixes that).
+
+#### Cache table (from the real `--progress=plain` logs)
+
+| Change you make | `COPY ...csproj` | `RUN dotnet restore` | `COPY src/DemoApi/` | `RUN dotnet publish` | Wall time |
+|-----------------|------------------|----------------------|---------------------|----------------------|-----------|
+| Nothing (rebuild) | CACHED | CACHED | CACHED | CACHED | 1.75 s |
+| Edit `Program.cs` (one character in a comment) | CACHED | CACHED | **rebuilt** | **rebuilt** | 5.85 s |
+| Add a NuGet package to the `.csproj` (`Humanizer.Core 2.14.1`) | **rebuilt** | **rebuilt** (`Restored ... in 1.8 sec`) | **rebuilt** | **rebuilt** | 9.14 s |
+| Change the base image tag `10.0` → `10.0.0` (as in the lab) | – | – | – | – | **build failed** (1.14 s) |
+| … → `10.0.403` (another tag, **same digest** as `10.0`) | CACHED | CACHED | CACHED | CACHED | 1.34 s |
+| … → `10.0.100` (another tag, **different digest**) | **rebuilt** | **rebuilt** (`Restored ... in 1.48 sec`) | **rebuilt** | **rebuilt** | 36.99 s (25.1 s of it pulling the image) |
+
+`WORKDIR /src` and `COPY Directory.Build.props` behaved like the `.csproj` column. They were rebuilt only in the base-image row.
+
+Notes on the rows:
+
+- **Edit `Program.cs`:** the first two dependency steps were `CACHED`. The restore was *not* repeated: compare 4.1, where the same edit repeated it.
+- **Add a NuGet package:** `COPY src/DemoApi/` would have been rebuilt anyway, because the `.csproj` also lives in `src/DemoApi/`. By Rule 1 it is rebuilt in any case, since its parent (the restore layer) is new.
+- **`10.0.0`:** the lab's example tag does **not exist** for the SDK image, because SDK tags use SDK versions (`10.0.100` … `10.0.403`):
+
+  ```text
+  #2 ERROR: mcr.microsoft.com/dotnet/sdk:10.0.0: not found
+  ERROR: failed to build: failed to solve: mcr.microsoft.com/dotnet/sdk:10.0.0: failed to resolve source metadata for mcr.microsoft.com/dotnet/sdk:10.0.0: mcr.microsoft.com/dotnet/sdk:10.0.0: not found
+  ```
+
+  The registry's tag list (`https://mcr.microsoft.com/v2/dotnet/sdk/tags/list`) and `docker buildx imagetools inspect` were then used to pick two existing tags:
+
+  ```text
+  10.0       Digest: sha256:de4fe90a98845d75910b9769662465c84de1a934665c431279d1382b2bddc02b
+  10.0.403   Digest: sha256:de4fe90a98845d75910b9769662465c84de1a934665c431279d1382b2bddc02b
+  10.0.100   Digest: sha256:c7445f141c04f1a6b454181bd098dcfa606c61ba0bd213d0a702489e5bd4cd71
+  ```
+
+- **`10.0.403`:** everything was `CACHED`. The cache key of `FROM` is the **resolved digest**, not the text of the tag, and `10.0.403` is currently the same image as `10.0`.
+- **`10.0.100`:** a different digest, so every later step was rebuilt, after a 25 s download of the other SDK image.
+
+**Conclusion.** The most expensive change is a change of the **base image** (a different digest). It is the first layer, so by Rule 1 every layer is rebuilt: the new base image (hundreds of MB) is downloaded, all dependencies are restored again, and the code is compiled again (37 s here, against 6 s for a code edit). This also happens without editing the Dockerfile at all, when a moving tag such as `10.0` gets a new patch release, which is why pinning the base image by version or digest matters. The next most expensive change is a **change of the dependencies** (`.csproj`/`pom.xml`): restore and everything after it run again (9.1 s). The cheapest change is the most frequent one, a **source code edit**: with `Dockerfile.cache` it only repeats `COPY src` + `publish` (5.9 s), while the restore stays cached. With `Dockerfile.naive`, the same edit also repeated the restore. In this tiny demo, the restore only takes about 1.5–3 s, so the absolute gain is small. The *structure* is what matters, because in a real project the restore and download are often the slowest part of the build.
 
 ## Task 5 – Multi-stage builds
 
@@ -649,8 +782,8 @@ _Pending._
 | 1 | .NET and Java apps built with their native tools; build steps listed | ✅ Done (native, WSL2) |
 | 2 | Task 2 questions answered (with real build observations) | ✅ Done |
 | 3 | Naive Dockerfiles built and analyzed with `docker history` | ✅ Done |
-| 4 | Cache behavior observed and the table filled in | ⏳ Pending |
-| 4 | `.dockerignore` files created | ⏳ Pending |
+| 4 | Cache behavior observed and the table filled in | ✅ Done (tag `10.0.0` does not exist; documented, tested with `10.0.403` and `10.0.100` instead) |
+| 4 | `.dockerignore` files created | ✅ Done (context 15.99 MB → 4.55 kB and 20.02 MB → 23.48 kB) |
 | 5 | Multi-stage Dockerfiles for .NET and Java, running as non-root | ⏳ Pending |
 | 5 | Image comparison table filled in with own measurements | ⏳ Pending |
 | 6 | `ARG`, `LABEL`, a `test` stage and a cache mount used | ⏳ Pending |
