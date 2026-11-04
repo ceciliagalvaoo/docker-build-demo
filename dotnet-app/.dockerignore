@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+**/TestResults/
+publish/
+.git/
+.gitignore
+.vs/
+.vscode/
+**/*.md
+Dockerfile*
+.dockerignore
+.env

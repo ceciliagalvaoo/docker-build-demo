@@ -1,0 +1,15 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0
+WORKDIR /src
+
+# 1. dependency definition only → this layer changes rarely
+COPY Directory.Build.props ./
+COPY src/DemoApi/DemoApi.csproj src/DemoApi/
+RUN dotnet restore src/DemoApi/DemoApi.csproj
+
+# 2. source code → this layer changes often
+COPY src/DemoApi/ src/DemoApi/
+RUN dotnet publish src/DemoApi/DemoApi.csproj -c Release -o /app --no-restore
+
+ENV ASPNETCORE_HTTP_PORTS=8080
+WORKDIR /app
+ENTRYPOINT ["dotnet", "DemoApi.dll"]
