@@ -254,7 +254,157 @@ The build outputs are excluded from Git: `dotnet-app/.gitignore` (`[Bb]in/`, `[O
 
 ## Task 2 – Anatomy of a Dockerfile and of `docker build`
 
-_Pending._
+Task 2 is mostly theory. To answer its questions with real observations instead of only the lab's tables, a small **throwaway** Dockerfile was built against the real `dotnet-app/` context. It uses one instruction of each kind and is **not committed**: it only lives in this report. Base image `alpine:3.20`, Docker Engine 28.5.1 / BuildKit v0.25.1 on WSL2.
+
+```dockerfile
+# Dockerfile.anatomy (experiment only)
+FROM alpine:3.20
+WORKDIR /app
+COPY Directory.Build.props global.json ./
+RUN wc -c Directory.Build.props global.json > sizes.txt
+ARG BUILD_NOTE=demo
+ENV APP_ENV=lab
+EXPOSE 8080
+USER nobody
+ENTRYPOINT ["cat"]
+CMD ["sizes.txt"]
+```
+
+### 2.2 / 2.3 Reading a real build (`--progress=plain`)
+
+First build (`docker build --progress=plain -f Dockerfile.anatomy -t anatomy-demo .` inside `dotnet-app/`):
+
+```text
+#1 [internal] load build definition from Dockerfile.anatomy        ← the Dockerfile is read and parsed (step 2)
+#1 transferring dockerfile: 272B done
+#2 [internal] load metadata for docker.io/library/alpine:3.20      ← tag resolved at the registry (step 3)
+#2 DONE 1.9s
+#3 [internal] load .dockerignore
+#3 transferring context: 2B 0.1s done                              ← no .dockerignore yet (added in Task 4)
+#5 [1/4] FROM docker.io/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+#4 [internal] load build context
+#4 transferring context: 326B 0.0s done                            ← build context sent (step 1)
+#5 sha256:25f1d6b1951a... 3.63MB / 3.63MB 0.3s done                ← missing base layer downloaded (step 3)
+#5 extracting sha256:25f1d6b1951a... 0.1s done
+#6 [2/4] WORKDIR /app                                              ← one node per instruction (steps 4–5)
+#6 DONE 0.1s
+#7 [3/4] COPY Directory.Build.props global.json ./
+#7 DONE 0.1s
+#8 [4/4] RUN wc -c Directory.Build.props global.json > sizes.txt
+#8 DONE 0.4s
+#9 exporting to image                                              ← manifest + config assembled (step 7)
+#9 exporting layers 0.0s done
+#9 writing image sha256:a304707936c9f9a323b835d0fd089feaae7f2638efd59c75272d257afe9e45dd done
+#9 naming to docker.io/library/anatomy-demo done                   ← tag applied, loaded into local store (step 8)
+```
+
+The same command run a second time, with no change:
+
+```text
+#4 [1/4] FROM docker.io/library/alpine:3.20@sha256:d9e8...
+#5 transferring context: 73B 0.0s done
+#6 [2/4] WORKDIR /app
+#6 CACHED
+#7 [3/4] COPY Directory.Build.props global.json ./
+#7 CACHED
+#8 [4/4] RUN wc -c Directory.Build.props global.json > sizes.txt
+#8 CACHED
+#9 writing image sha256:a304707936c9... done                        ← identical image ID
+```
+
+Observations:
+
+- The tag `alpine:3.20` was resolved to a **digest** (`@sha256:d9e8...`). That is what the build really uses.
+- Only the instructions that touch the filesystem (`WORKDIR`, `COPY`, `RUN`) appear as `[n/4]` steps. `ARG`, `ENV`, `EXPOSE`, `USER`, `ENTRYPOINT` and `CMD` have no step in the output: they are only written into the image config during `exporting to image`.
+- The context transfer was only **326 B**, although `dotnet-app/` contains `bin/`, `obj/` and `publish/` from Task 1. BuildKit only sends the paths that the Dockerfile actually needs (here the two `COPY` sources), and on a repeated build only what changed (73 B). With `COPY . .` (Task 3), the whole folder has to be sent, which makes `.dockerignore` matter (Task 4).
+
+### Layers vs metadata (evidence)
+
+```text
+$ docker history anatomy-demo
+IMAGE          CREATED          CREATED BY                                      SIZE      COMMENT
+a304707936c9   12 seconds ago   CMD ["sizes.txt"]                               0B        buildkit.dockerfile.v0
+<missing>      12 seconds ago   ENTRYPOINT ["cat"]                              0B        buildkit.dockerfile.v0
+<missing>      12 seconds ago   USER nobody                                     0B        buildkit.dockerfile.v0
+<missing>      12 seconds ago   EXPOSE [8080/tcp]                               0B        buildkit.dockerfile.v0
+<missing>      12 seconds ago   ENV APP_ENV=lab                                 0B        buildkit.dockerfile.v0
+<missing>      12 seconds ago   ARG BUILD_NOTE=demo                             0B        buildkit.dockerfile.v0
+<missing>      12 seconds ago   RUN /bin/sh -c wc -c Directory.Build.props g…   70B       buildkit.dockerfile.v0
+<missing>      12 seconds ago   COPY Directory.Build.props global.json ./ # …   236B      buildkit.dockerfile.v0
+<missing>      12 seconds ago   WORKDIR /app                                    0B        buildkit.dockerfile.v0
+<missing>      6 months ago     CMD ["/bin/sh"]                                 0B        buildkit.dockerfile.v0
+<missing>      6 months ago     ADD alpine-minirootfs-3.20.10-x86_64.tar.gz …   7.81MB    buildkit.dockerfile.v0
+
+$ docker image inspect anatomy-demo --format '{{json .RootFS.Layers}}'     # 4 filesystem layers
+["sha256:08bc4e53...", "sha256:94683cce...", "sha256:58b01f54...", "sha256:15ad8f62..."]
+#  = alpine base, WORKDIR /app (creates the directory), COPY, RUN
+
+$ docker image inspect anatomy-demo --format 'Entrypoint={{json .Config.Entrypoint}} Cmd={{json .Config.Cmd}} User={{json .Config.User}} WorkingDir={{json .Config.WorkingDir}} Env={{json .Config.Env}} ExposedPorts={{json .Config.ExposedPorts}}'
+Entrypoint=["cat"] Cmd=["sizes.txt"] User="nobody" WorkingDir="/app" Env=["PATH=...","APP_ENV=lab"] ExposedPorts={"8080/tcp":{}}
+```
+
+`docker images` reports **7.81 MB**: the alpine layer plus 236 B + 70 B. Every metadata instruction is 0 B. They do not exist as layers; they live in `.Config`. `WORKDIR` is listed as 0 B but still produced a (nearly empty) filesystem layer, because it created the `/app` directory. That matches the lab's "metadata (plus the directory)".
+
+**A metadata-only change does not touch the layers.** In a copy of the Dockerfile, only `ENV APP_ENV=lab` was changed to `lab2`. All filesystem steps were `CACHED`, and the result has **the same four layer digests** but a **different image ID**, because the image ID is the hash of the config, and the config changed:
+
+```text
+anatomy-demo:ctx  id=sha256:a42e943b59ee...  layers=[08bc4e53…, 94683cce…, 9b510fce…, a5c96ccb…]
+anatomy-demo:ctx2 id=sha256:2a517506d910...  layers=[08bc4e53…, 94683cce…, 9b510fce…, a5c96ccb…]   (ENV changed)
+```
+
+**A file change invalidates its layer and everything after it (Rule 1).** In a scratch copy of the context, `global.json` was edited (`latestFeature` → `latestPatch`) and the image rebuilt:
+
+```text
+#6 [2/4] WORKDIR /app
+#6 CACHED                                                  ← before the change: reused
+#7 [3/4] COPY Directory.Build.props global.json ./
+#7 DONE 0.0s                                               ← checksum of copied files changed → cache miss
+#8 [4/4] RUN wc -c Directory.Build.props global.json > sizes.txt
+#8 DONE 0.3s                                               ← RUN text unchanged, but parent layer is new → rebuilt
+```
+
+### Runtime behavior (ENTRYPOINT/CMD, ENV/ARG)
+
+```text
+$ docker run --rm anatomy-demo                       # ENTRYPOINT ["cat"] + CMD ["sizes.txt"]
+      149 Directory.Build.props
+       87 global.json
+      236 total
+
+$ docker run --rm anatomy-demo /etc/alpine-release   # arguments replace CMD, ENTRYPOINT stays
+3.20.10
+
+$ docker run --rm --entrypoint sh anatomy-demo -c 'echo "APP_ENV=$APP_ENV BUILD_NOTE=${BUILD_NOTE:-<unset>} user=$(id -un)"'
+APP_ENV=lab BUILD_NOTE=<unset> user=nobody
+```
+
+### Answers
+
+**1. Which instructions produce layers with files, and which only change metadata? Why does it matter for the size?**
+
+`FROM` (brings in the base image's layers), `COPY`/`ADD` and `RUN` create layers with files. `WORKDIR` creates only an empty directory if it does not exist yet. `ENV`, `ARG`, `LABEL`, `EXPOSE`, `USER`, `ENTRYPOINT`, `CMD` and `HEALTHCHECK` only change the image configuration. The `docker history` above shows them all with 0 B, and the config change kept the same layer digests.
+
+It matters because the image size is the **sum of its file layers**, and layers are immutable. A file added in one layer and deleted in a later `RUN` is still stored in the earlier layer; the deletion only hides it. The size is therefore decided by `FROM` (which base image) and by what `COPY`/`RUN` put in. For this lab:
+
+- The .NET build output is only 916 KB (Task 1), but an image based on `mcr.microsoft.com/dotnet/sdk:10.0` carries the whole SDK.
+- `COPY . .` also copies `bin/`, `obj/` and `publish/` into a layer.
+
+Adding `ENV` or `LABEL` lines, on the other hand, costs nothing. Shrinking an image means choosing a smaller `FROM` and copying fewer files: a multi-stage build (Task 5) and `.dockerignore` (Task 4).
+
+**2. Why does Rule 1 make the order of instructions important?**
+
+The cache key of a step includes its **parent layer**. When one step misses the cache, every later step has a new parent, so each of them misses too, even if its own text and inputs did not change. The experiment shows it: only `global.json` changed, yet the `RUN` after the `COPY` was executed again.
+
+The cache can therefore only be reused up to the **first** changed step, and the order decides how much work a typical change costs. If an expensive step (`dotnet restore` downloading NuGet packages, `mvn dependency:go-offline` downloading the Maven repository) comes **after** a `COPY` of frequently changing files (`COPY . .` with `Program.cs`), every code edit repeats the download. If it comes **after a `COPY` of only the dependency files** (`DemoApi.csproj`, `pom.xml`), a code edit leaves it cached and only the compile step runs again. This is the change from `Dockerfile.naive` to `Dockerfile.cache` in Task 4.
+
+**3. `ENTRYPOINT` vs `CMD`, and `ENV` vs `ARG`?**
+
+- **`ENTRYPOINT`** is the program that the container always runs. **`CMD`** holds its *default arguments* (or the default command, if there is no `ENTRYPOINT`). Arguments after the image name in `docker run` **replace `CMD`** but keep the `ENTRYPOINT`. Above, `docker run anatomy-demo /etc/alpine-release` still ran `cat`, now on a different file. Replacing the `ENTRYPOINT` needs an explicit `--entrypoint`. For the lab apps, `ENTRYPOINT ["dotnet", "DemoApi.dll"]` makes the container *be* the API. Both should use the exec form (JSON array), so that the app runs as PID 1 and receives `SIGTERM`.
+- **`ARG`** exists **only during the build**. Its value is set with `--build-arg`, and it is scoped to the stage in which it is declared. **`ENV`** is stored in the image config and is present **in every running container** (and in later build steps). Above, `APP_ENV=lab` was set at runtime and `BUILD_NOTE` was not. For the lab apps, `ENV ASPNETCORE_HTTP_PORTS=8080` configures the running API, while `ARG APP_VERSION` (Task 6) only feeds the build.
+
+  **Warning:** `docker history` shows the `ARG` line (`ARG BUILD_NOTE=demo`). Build arguments are therefore *not* secret. Task 6.5 demonstrates the leak.
+
+The experiment images (`anatomy-demo:*`) were deleted after the observations.
 
 ## Task 3 – Naive Dockerfiles
 
@@ -284,7 +434,7 @@ _Pending._
 |---|------|--------|
 | 0 | Public `docker-build-demo` repository created and cloned; tools checked | ✅ Done |
 | 1 | .NET and Java apps built with their native tools; build steps listed | ✅ Done (native, WSL2) |
-| 2 | Task 2 questions answered | ⏳ Pending |
+| 2 | Task 2 questions answered (with real build observations) | ✅ Done |
 | 3 | Naive Dockerfiles built and analyzed with `docker history` | ⏳ Pending |
 | 4 | Cache behavior observed and the table filled in | ⏳ Pending |
 | 4 | `.dockerignore` files created | ⏳ Pending |
