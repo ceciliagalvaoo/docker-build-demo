@@ -1357,9 +1357,240 @@ The only builder uses the `docker` driver with the classic image store (`overlay
 
 ## Task 7 – Tagging, publishing and running the image
 
-_Pending._
+Environment: Docker Engine 28.5.1 on WSL2, branch `task-7-ghcr-publish`. The published image is `demo-dotnet` built from [`dotnet-app/Dockerfile`](https://github.com/ceciliagalvaoo/docker-build-demo/blob/main/dotnet-app/Dockerfile) (Task 6 version) with `--build-arg APP_VERSION=0.1.0`, on the tree of `main` at commit `d348d1d` (the merge of the Task 6 PR).
+
+- **Who did what:** the registry login and all `docker push` commands were run by the repository owner (PowerShell → `wsl docker ...`). Tagging, pulling and running were done in WSL2.
+- **Credentials:** the token was a classic PAT with `write:packages`/`read:packages` and was never written to a file or to this report. Docker stores the credentials through the configured credential helper (`credsStore: desktop.exe` → Windows Credential Manager).
+
+> **Published package:** <https://github.com/ceciliagalvaoo/docker-build-demo/pkgs/container/demo-dotnet>, public, linked to this repository through the `org.opencontainers.image.source` label.
+> **Image:** `ghcr.io/ceciliagalvaoo/demo-dotnet`, digest of `0.1.0`: `sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3`
+
+### 7.1 Tags and digests
+
+```text
+$ docker build --build-arg APP_VERSION=0.1.0 -t demo-dotnet:multistage .     # all steps CACHED → image 112fb9bf0f34
+$ docker tag demo-dotnet:multistage demo-dotnet:0.1.0
+$ docker tag demo-dotnet:multistage demo-dotnet:0.1
+$ docker tag demo-dotnet:multistage demo-dotnet:latest
+$ docker images demo-dotnet
+REPOSITORY    TAG          IMAGE ID       CREATED          SIZE
+demo-dotnet   test         434ce75a062a   10 minutes ago   951MB
+demo-dotnet   0.1          112fb9bf0f34   22 minutes ago   231MB
+demo-dotnet   0.1.0        112fb9bf0f34   22 minutes ago   231MB
+demo-dotnet   latest       112fb9bf0f34   22 minutes ago   231MB
+demo-dotnet   multistage   112fb9bf0f34   22 minutes ago   231MB
+demo-dotnet   cache        095da7c88250   27 minutes ago   925MB
+demo-dotnet   naive        fe35b194ba31   28 minutes ago   925MB
+```
+
+Four tags, **one IMAGE ID**: a tag is only a name pointing to an image, and tagging copies nothing.
+
+Tags used for the registry (namespace = GitHub user `ceciliagalvaoo`, lowercase as required):
+
+| Image tag | Meaning here | Moves over time? |
+|-----------|--------------|------------------|
+| `0.1.0` | Exact release; matches `APP_VERSION=0.1.0` and the `org.opencontainers.image.version` label | should not (but technically can, see 7.3) |
+| `0.1` | Latest patch of the 0.1 line | yes |
+| `latest` | Latest release | yes |
+| `sha-d348d1d` | Built from commit `d348d1d` (`git rev-parse --short HEAD` on `main`) | no |
+
+**Image tags vs Git tags.** These are *image* tags in the registry. A *Git* tag such as `v0.1.0` would be a separate object in the Git repository, marking the commit the release was built from. No Git tag was created in this lab. The link between image and commit is carried by the `sha-d348d1d` image tag and the labels. Creating `v0.1.0` on `d348d1d` is optional and up to the repository owner.
+
+### 7.2 Publishing to `ghcr.io`
+
+```text
+$ docker tag demo-dotnet:multistage ghcr.io/ceciliagalvaoo/demo-dotnet:{0.1.0,0.1,latest,sha-d348d1d}   (four docker tag commands)
+
+PS> wsl docker login ghcr.io -u ceciliagalvaoo           # token pasted at the Password: prompt
+Login Succeeded
+
+PS> wsl docker push ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0
+The push refers to repository [ghcr.io/ceciliagalvaoo/demo-dotnet]
+25ffd3b37f45: Pushed
+f571688ae24e: Pushed
+eaa51743b39d: Pushed
+361fe91f35cc: Pushed
+2c16277b36ff: Pushed
+7be251a39e9c: Pushed
+fa09e76fa81b: Pushed
+bec87777bc2f: Pushed
+0.1.0: digest: sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3 size: 1996
+
+PS> wsl docker push ghcr.io/ceciliagalvaoo/demo-dotnet:0.1
+25ffd3b37f45: Layer already exists       (… all 8 layers)
+0.1: digest: sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3 size: 1996
+
+PS> wsl docker push ghcr.io/ceciliagalvaoo/demo-dotnet:latest
+latest: digest: sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3 size: 1996
+
+PS> wsl docker push                                          ← first attempt for the 4th tag: argument missing
+docker: 'docker push' requires 1 argument
+PS> wsl docker push ghcr.io/ceciliagalvaoo/demo-dotnet:sha-d348d1d   ← repeated; verified in the registry below
+```
+
+Only the first push uploaded layers. Every further tag reused them (`Layer already exists`) and produced **the same digest**, because it is the same manifest.
+
+**Visibility and link.** The package was created as **private**. Before changing it, an anonymous request was denied (`{"errors":[{"code":"DENIED","message":"invalid token"}]}`, manifest → HTTP 403). The owner then set it to **public** in *Package settings → Change visibility*. The settings page shows *Repository source: ceciliagalvaoo/docker-build-demo* with `org.opencontainers.image.source = "https://github.com/ceciliagalvaoo/docker-build-demo"`, so the link to the repository was created **automatically** from the label added in Task 6. The old package URL `https://github.com/users/ceciliagalvaoo/packages/container/package/demo-dotnet` now redirects (HTTP 302) to the repository's package page, which returns HTTP 200 without logging in.
+
+**Registry state, checked anonymously** (anonymous pull token from `https://ghcr.io/token?scope=repository:ceciliagalvaoo/demo-dotnet:pull`, then the Registry API, with no credentials):
+
+```text
+tags: {"name":"ceciliagalvaoo/demo-dotnet","tags":["0.1.0","0.1","latest","sha-d348d1d"]}
+0.1.0          HTTP 200  digest sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3
+0.1            HTTP 200  digest sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3
+latest         HTTP 200  digest sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3
+sha-d348d1d    HTTP 200  digest sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3
+```
+
+**Remote manifest** (`docker buildx imagetools inspect ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0`):
+
+```text
+MediaType: application/vnd.docker.distribution.manifest.v2+json
+Digest:    sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3
+config: sha256:112fb9bf0f34  4672 B          ← the config digest is the local IMAGE ID
+8 layers, 97.2 MB compressed (the local image is 231 MB uncompressed)
+```
+
+Two different hashes describe one image. The **IMAGE ID** (`112fb9bf0f34…`) is the hash of the image *config*. The **digest** (`ddaab9e3…`) is the hash of the *manifest* (the config and the list of compressed layers) as stored in the registry. `docker pull` / `docker run ...@sha256:` use the digest.
+
+**Delete, pull back, run:**
+
+```text
+$ docker rmi ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0
+Untagged: ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0
+$ docker pull ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0
+0.1.0: Pulling from ceciliagalvaoo/demo-dotnet
+Digest: sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3
+Status: Downloaded newer image for ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0
+$ docker run --rm -p 8080:8080 ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0
+$ curl http://localhost:8080/weatherforecast
+[{"date":"2026-11-05","temperatureC":-4,"summary":"Sweltering","temperatureF":25}, ...]
+HTTP 200        (process: uid=1654(app))
+```
+
+**Limitation of this check.** This is the machine that built the image. Even after removing *all* local tags of image `112fb9bf0f34` (and the image itself was gone from `docker images`), `docker pull` reported the 8 layers as `Already exists`, because the BuildKit build cache still holds them. So the pull on this host fetched the manifest and config from GHCR, but not the layer blobs. That the full image is available to others is shown by the **anonymous** Registry API checks above (public manifests and tags, HTTP 200) and by the remote manifest. A pull on a machine that never built the image would download the 97.2 MB of layers.
+
+### 7.3 Running by digest, and overwriting a tag
+
+```text
+$ docker image inspect ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0 --format '{{index .RepoDigests 0}}'
+ghcr.io/ceciliagalvaoo/demo-dotnet@sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3
+
+$ docker run --rm -p 8080:8080 ghcr.io/ceciliagalvaoo/demo-dotnet@sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3
+$ curl http://localhost:8080/weatherforecast            → HTTP 200, uid=1654(app)
+container image: ghcr.io/ceciliagalvaoo/demo-dotnet@sha256:ddaab9e3... → sha256:112fb9bf0f34...
+```
+
+**Overwrite experiment (demo package only).** A *different* image was pushed under the existing tag `0.1.0`. It is the same app, built from the same Dockerfile with one extra label: `docker build --build-arg APP_VERSION=0.1.0 --label lab.experiment=tag-overwrite-test -t demo-dotnet:overwrite-exp .`, which gives the same 8 filesystem layers, a different config and image ID `edfe6dc6cc8e`.
+
+```text
+PS> wsl docker tag demo-dotnet:overwrite-exp ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0
+PS> wsl docker push ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0
+25ffd3b37f45: Layer already exists        (… all 8 layers: only the new config + manifest were uploaded)
+0.1.0: digest: sha256:1d14cbd66c9cee20a3698be2233ddddfb674728d6e19a7883d8f25bbfefd68a0 size: 1996
+```
+
+Registry state checked anonymously, **before → after** the overwrite:
+
+| Reference | Before | After the overwrite |
+|-----------|--------|---------------------|
+| tag `0.1.0` | `sha256:ddaab9e3…` | **`sha256:1d14cbd6…`** (pull → image `edfe6dc6cc8e`, label `lab.experiment=tag-overwrite-test`) |
+| tags `0.1`, `latest`, `sha-d348d1d` | `sha256:ddaab9e3…` | `sha256:ddaab9e3…` (unchanged) |
+| `@sha256:ddaab9e3…` | HTTP 200 | **still HTTP 200**: `docker run …@sha256:ddaab9e3…` → image `112fb9bf0f34`, `/weatherforecast` HTTP 200 |
+| `@sha256:1d14cbd6…` | – | HTTP 200: `docker run …@sha256:1d14cbd6…` → image `edfe6dc6cc8e`, HTTP 200 |
+
+**Restore.** The original image was pushed to `0.1.0` again (`docker tag demo-dotnet:multistage ghcr.io/ceciliagalvaoo/demo-dotnet:0.1.0` + push):
+
+```text
+0.1.0: digest: sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3 size: 1996
+```
+
+It got **exactly the original digest** again, because the content is identical and the digest is a pure content hash. Final state (anonymous): all four tags → `ddaab9e3…`. The experimental manifest `sha256:1d14cbd6…` still exists **untagged** as a package version (HTTP 200 by digest). The final pull + run by tag and by digest again returned `/weatherforecast` HTTP 200 as `uid=1654(app)`.
+
+**What happened to the old image and to the digest?**
+
+- **The old image:** it was not deleted or changed. Pushing to an existing tag only **moves the tag** to the new manifest. The old manifest stayed in the registry: still reachable by its digest, still referenced by the other tags (`0.1`, `latest`, `sha-d348d1d`), and it would have remained as an untagged package version even without them.
+- **The digests:** the new image got a **new digest** (`1d14cbd6…`), because any change to the content (here only one label in the config) changes the hash. The old digest still identifies exactly the old content.
+- **What this means for users:** someone who runs `0.1.0` today and tomorrow may get two different images without noticing.
+
+**Why is running by digest safer than running by tag?** A digest is a content hash: it is **immutable** and verifiable. `image@sha256:ddaab9e3…` always resolves to exactly the same bytes, on every machine and at any time, and Docker verifies the downloaded content against it. A tag is a mutable pointer that anyone with push rights can move, by mistake or deliberately (a compromised account, a CI job that re-pushes), as just demonstrated with `0.1.0`. Pinning by digest therefore gives reproducible deployments (the image tested is the image deployed), protects against silent changes or tampering, and makes rollbacks exact. The usual compromise is to deploy by digest and keep tags for humans, or to use `name:tag@sha256:…`.
+
+### 7.4 Running containers
+
+```text
+$ docker run -d --name demo -p 8080:8080 -e ASPNETCORE_ENVIRONMENT=Development demo-dotnet:0.1.0
+63be1b8a4c3e...
+$ docker ps
+NAMES     IMAGE               STATUS         PORTS
+demo      demo-dotnet:0.1.0   Up 4 seconds   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+$ docker logs demo
+      Now listening on: http://[::]:8080
+      Hosting environment: Development           ← the -e variable reached the app
+$ docker exec demo sh -c 'echo "shell inside: $(id -un) on $(hostname)"'
+shell inside: app on 63be1b8a4c3e                ← works: aspnet:10.0 is Debian-based (it would fail on chiseled, see Task 5)
+$ curl http://localhost:8080/weatherforecast     → HTTP 200
+$ docker stop demo && docker rm demo
+```
+
+**What does `-p 8080:8080` mean?** `-p HOST:CONTAINER`. The **left** side is the port on the host, where clients such as `curl localhost:8080` connect. The **right** side is the port inside the container's network namespace, where the application must be listening. Docker forwards host:8080 → container:8080.
+
+**What happens with `-p 9090:8081` when the app listens on 8080?**
+
+```text
+$ docker run -d --name demo-wrongport -p 9090:8081 demo-dotnet:0.1.0
+$ docker ps --format '{{.Ports}}'
+8080/tcp, 0.0.0.0:9090->8081/tcp, [::]:9090->8081/tcp
+$ docker logs demo-wrongport
+      Now listening on: http://[::]:8080
+$ curl http://localhost:9090/weatherforecast
+curl: (56) Recv failure: Connection reset by peer        HTTP 000, curl exit=56
+$ docker exec demo-wrongport sh -c 'awk ... /proc/net/tcp6'
+listening (hex port): 00000000000000000000000000000000:1F90     ← 0x1F90 = 8080
+```
+
+The container starts normally and Docker does open port 9090 on the host. However, it forwards the traffic to port **8081** inside the container, where nothing is listening, while the app listens on 8080. The connection is accepted by Docker's proxy and then reset, so the client gets no HTTP response at all. `8080/tcp` appears unpublished in `docker ps`, because it is only exposed (`EXPOSE`). The fix is to map to the port the app really uses (`-p 9090:8080`), or to make the app listen on 8081 (`-e ASPNETCORE_HTTP_PORTS=8081`).
+
+### Expected result of Task 7
+
+- Public image: <https://github.com/ceciliagalvaoo/docker-build-demo/pkgs/container/demo-dotnet> (`ghcr.io/ceciliagalvaoo/demo-dotnet`).
+- `docker images` with several tags of the same IMAGE ID: see 7.1 (`0.1.0`, `0.1`, `latest`, `multistage`, all `112fb9bf0f34`).
+- Digest `sha256:ddaab9e34d932a26b23d2a45b1935fbc527148f0cfbb4fb0c2c48da8db5a1fc3`, with the run by digest and the answers to 7.3 and 7.4 above.
 
 ---
+
+## Final repository structure
+
+[`ceciliagalvaoo/docker-build-demo`](https://github.com/ceciliagalvaoo/docker-build-demo) (public). Each task was merged through its own pull request (#1–#7, plus the Task 7 PR).
+
+```text
+docker-build-demo/
+├── docs/
+│   └── docker-build-lab.md          # this report
+├── dotnet-app/
+│   ├── src/DemoApi/                 # webapi template (Program.cs, DemoApi.csproj, appsettings*.json, ...)
+│   ├── tests/DemoApi.Tests/         # xunit template (UnitTest1.cs, DemoApi.Tests.csproj)
+│   ├── DemoApp.slnx
+│   ├── Directory.Build.props
+│   ├── global.json
+│   ├── Dockerfile.naive             # Task 3
+│   ├── Dockerfile.cache             # Task 4
+│   ├── Dockerfile                   # Task 5 multi-stage, extended in Task 6
+│   ├── .dockerignore                # Task 4
+│   └── .gitignore                   # incl. the !Dockerfile.cache exception
+└── java-app/
+    ├── src/main/java/hr/demo/demo/DemoApplication.java
+    ├── src/test/java/hr/demo/demo/DemoApplicationTests.java
+    ├── src/main/resources/application.properties
+    ├── pom.xml
+    ├── mvnw, mvnw.cmd, .mvn/wrapper/  # Maven wrapper (mvnw stored as 100755)
+    ├── Dockerfile.naive             # Task 3
+    ├── Dockerfile                   # Task 5 multi-stage, extended in Task 6
+    ├── .dockerignore                # Task 4
+    ├── .gitattributes
+    └── .gitignore
+```
+
+Not committed on purpose: the build outputs (`bin/`, `obj/`, `publish/`, `target/`), the experiment Dockerfiles (Task 2 anatomy, Task 4 base-tag copies, Task 5 chiseled copy, Task 6 secret demos, all reproduced in this report), and `token.txt` (deleted).
 
 ## Final checklist (Tasks 0–7)
 
@@ -1378,5 +1609,6 @@ _Pending._
 | 6 | `ARG`, `LABEL`, a `test` stage and a cache mount used | ✅ Done (`--target test` passes; fails with exit code 1 on a failing test) |
 | 6 | Secret leak demonstrated, and a secret mount used | ✅ Done (fake value only; images never pushed, deleted) |
 | 6 | Multi-platform build | ➖ Optional, not executed (docker driver does not support it; explained) |
-| 7 | Image tagged, pushed to `ghcr.io`, pulled and run, also by digest | ⏳ Pending |
+| 7 | Image tagged, pushed to `ghcr.io`, pulled and run, also by digest | ✅ Done ([package](https://github.com/ceciliagalvaoo/docker-build-demo/pkgs/container/demo-dotnet), public; digest `sha256:ddaab9e3…`) |
+| 7 | Tag overwrite experiment (digest before/after) | ✅ Done (`ddaab9e3…` → `1d14cbd6…` → restored `ddaab9e3…`) |
 | 8 | Project containerized and documented | ➖ Out of scope for this report (separate deliverable in the project repository) |
